@@ -1,0 +1,55 @@
+name: Cliptown MCP server conformance
+
+on:
+  pull_request:
+    paths:
+      - .github/workflows/mcp-server-conformance.yml
+      - README.md
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  PRODUCTION_REVISION: ba13c7b75dda2c7b9aee237ccb56db299d5686d7
+
+jobs:
+  production-server:
+    name: Rust ${{ matrix.rust }} production conformance
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        rust: ["1.88.0", "1.97.0"]
+    steps:
+      - name: Check out test oracle
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          persist-credentials: false
+      - name: Check out immutable production server
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          repository: cliptown/cliptown-mcp-server.rs
+          ref: ${{ env.PRODUCTION_REVISION }}
+          path: production-server
+          persist-credentials: false
+      - name: Verify immutable production revision
+        run: test "$(git -C production-server rev-parse HEAD)" = "$PRODUCTION_REVISION"
+      - name: Install exact Rust toolchain
+        run: rustup toolchain install "${{ matrix.rust }}" --profile minimal --component rustfmt,clippy
+      - name: Verify formatting
+        working-directory: production-server
+        run: cargo +${{ matrix.rust }} fmt --all -- --check
+      - name: Exercise real MCP process and all targets
+        working-directory: production-server
+        run: cargo +${{ matrix.rust }} test --locked --all-targets
+      - name: Reject warnings
+        working-directory: production-server
+        run: cargo +${{ matrix.rust }} clippy --locked --all-targets -- -D warnings
