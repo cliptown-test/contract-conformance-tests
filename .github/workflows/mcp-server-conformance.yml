@@ -17,7 +17,7 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  PRODUCTION_REVISION: ba13c7b75dda2c7b9aee237ccb56db299d5686d7
+  PRODUCTION_REVISION: 053979a3032ce187cda42cfb8b4ac78d2c05c335
 
 jobs:
   production-server:
@@ -27,14 +27,14 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        rust: ["1.88.0", "1.97.0"]
+        rust: ["1.95.0", "1.97.0"]
     steps:
       - name: Check out test oracle
-        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           persist-credentials: false
       - name: Check out immutable production server
-        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           repository: cliptown/cliptown-mcp-server.rs
           ref: ${{ env.PRODUCTION_REVISION }}
