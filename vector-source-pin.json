@@ -1,0 +1,16 @@
+{
+  "contractVersion": 1,
+  "linearIssue": "DEN-3040",
+  "productRepository": "cliptown/cliptown-lib-core",
+  "revision": "3c4eb384cd7b13bfbc3c3336268365f466a1221d",
+  "schema": "cliptown",
+  "purpose": "clip_search",
+  "expected": {
+    "exactDimensions": 4100,
+    "indexedDimensions": 4000,
+    "fullPrecisionIndexCeiling": 2000,
+    "halfPrecisionIndexCeiling": 4000,
+    "maximumSourceDimensions": 4096,
+    "targets": ["postgresql", "neon", "supabase"]
+  }
+}
