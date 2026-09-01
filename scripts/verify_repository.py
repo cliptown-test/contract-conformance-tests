@@ -27,7 +27,11 @@ if not (ROOT / "tests").is_dir() or not list((ROOT / "tests").glob("test_*.py"))
 marker = re.compile(r"^(<{7}|={7}|>{7})", re.MULTILINE)
 credential = re.compile(r"gh[pousr]_[A-Za-z0-9]{20,}|lin_api_[A-Za-z0-9]{20,}|BEGIN [A-Z ]*PRIVATE KEY")
 for path in ROOT.rglob("*"):
-    if not path.is_file() or ".git" in path.parts or path.stat().st_size > 1_000_000:
+    if (
+        not path.is_file()
+        or {".git", ".ores"} & set(path.parts)
+        or path.stat().st_size > 1_000_000
+    ):
         continue
     try:
         text = path.read_text(encoding="utf-8")
