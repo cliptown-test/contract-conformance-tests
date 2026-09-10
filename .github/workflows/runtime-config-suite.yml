@@ -1,0 +1,40 @@
+name: runtime config suite
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  runtime-config-suite:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Check out exact candidate
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
+      - name: Verify exact candidate
+        run: test "$(git rev-parse HEAD)" = "${{ github.event.pull_request.head.sha || github.sha }}"
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1
+        with:
+          python-version: '3.12'
+          cache: ''
+      - name: Check out immutable shared harness
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          repository: flags-2-env-test/contract-conformance-tests
+          ref: f89b147a9a0b0c5699eb1b544fc1825946957c7f
+          path: _runtime-config-harness
+          persist-credentials: false
+      - name: Verify harness identity
+        run: test "$(git -C _runtime-config-harness rev-parse HEAD)" = "f89b147a9a0b0c5699eb1b544fc1825946957c7f"
+      - name: Run adversarial config matrix
+        env:
+          RUNTIME_CONFIG_PRODUCT: cliptown-test
+        run: python _runtime-config-harness/tests/test_runtime_config_suite.py
