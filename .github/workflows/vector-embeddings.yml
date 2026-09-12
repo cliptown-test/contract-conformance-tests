@@ -1,0 +1,66 @@
+name: Vector and embedding conformance
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  schedule:
+    - cron: "41 9 * * 4"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: vector-embeddings-${{ github.repository }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  postgres-family:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    services:
+      postgres:
+        image: pgvector/pgvector:0.8.1-pg16
+        env:
+          POSTGRES_DB: vector_contract
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_USER: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres -d vector_contract"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 12
+    steps:
+      - name: Check out external conformance suite
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+          show-progress: false
+      - name: Resolve the pinned product authority
+        id: product
+        run: >-
+          node -e 'const fs=require("fs"); const p=require("./vector-source-pin.json");
+          if(!/^[0-9a-f]{40}$/.test(p.revision)) process.exit(1);
+          fs.appendFileSync(process.env.GITHUB_OUTPUT,
+          "repository=" + p.productRepository + "\nrevision=" + p.revision + "\n")'
+      - name: Check out the exact product contract
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          repository: ${{ steps.product.outputs.repository }}
+          ref: ${{ steps.product.outputs.revision }}
+          path: .product-source
+          persist-credentials: false
+          show-progress: false
+          token: ${{ secrets.TEST_FLEET_READ_TOKEN || github.token }}
+      - name: Exercise vector storage, search, RLS, and Supabase privileges
+        env:
+          PGDATABASE: vector_contract
+          PGHOST: localhost
+          PGPASSWORD: postgres
+          PGPORT: "5432"
+          PGUSER: postgres
+          PRODUCT_ROOT: ${{ github.workspace }}/.product-source
+        run: node tests/vector_contract.mjs
