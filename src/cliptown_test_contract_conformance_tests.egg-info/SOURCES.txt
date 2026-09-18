@@ -1,0 +1,9 @@
+README.md
+pyproject.toml
+src/cliptown_test_contract_conformance_tests.egg-info/PKG-INFO
+src/cliptown_test_contract_conformance_tests.egg-info/SOURCES.txt
+src/cliptown_test_contract_conformance_tests.egg-info/dependency_links.txt
+src/cliptown_test_contract_conformance_tests.egg-info/top_level.txt
+src/deep_tests/__init__.py
+src/deep_tests/contract_model.py
+tests/test_contract_conformance.py
