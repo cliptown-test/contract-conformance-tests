@@ -1,0 +1,5 @@
+Metadata-Version: 2.4
+Name: cliptown-test-contract-conformance-tests
+Version: 0.1.0
+Summary: Deterministic state-model, idempotency, serialization, and protocol contract conformance tests.
+Requires-Python: >=3.11
