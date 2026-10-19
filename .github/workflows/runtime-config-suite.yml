@@ -38,3 +38,34 @@ jobs:
         env:
           RUNTIME_CONFIG_PRODUCT: cliptown-test
         run: python _runtime-config-harness/tests/test_runtime_config_suite.py
+
+  task-scope-oracle:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Check out exact candidate
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
+
+      - name: Prove source-free boundary
+        run: |
+          set -euo pipefail
+          test ! -e private-oreslang-source
+          test ! -e oreslang-source.java
+          test ! -e mirrored-source
+          echo "SOURCE_FREE_BOUNDARY=PASS"
+
+      - uses: actions/setup-java@cf277c60eb25467037889841efdb72551f06f6c3
+        with:
+          distribution: temurin
+          java-version: "21"
+
+      - name: Compile source-free structured-task oracle
+        run: |
+          mkdir -p build/task-scope-oracle
+          javac --release 21 -Xlint:all -Werror             -d build/task-scope-oracle             canary/TaskScopeQuiescenceOracle.java
+
+      - name: Run source-free structured-task oracle
+        run: java -ea -cp build/task-scope-oracle canary.TaskScopeQuiescenceOracle
