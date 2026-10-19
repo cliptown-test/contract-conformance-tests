@@ -105,8 +105,12 @@ public final class TaskScopeQuiescenceOracle {
         private boolean sealed;
 
         Child addChild() {
+            return addChild(() -> { });
+        }
+
+        Child addChild(Runnable revoker) {
             final Child[] holder = new Child[1];
-            SplitFuture future = new SplitFuture(() -> { }, () -> markTerminal(holder[0]));
+            SplitFuture future = new SplitFuture(revoker, () -> markTerminal(holder[0]));
             Child child = new Child(future);
             holder[0] = child;
             synchronized (lock) {
@@ -182,8 +186,9 @@ public final class TaskScopeQuiescenceOracle {
         twoPhaseRevokesAllBeforeBlockingSubscribers();
         terminalReadyBeatsBlockingSubscriber();
         physicalQuiescenceRemainsRequired();
+        nestedCancellationIsTransitive();
         raceStress();
-        System.out.println("TASK_SCOPE_ORACLE=PASS races=20000 blocked_subscribers=3");
+        System.out.println("TASK_SCOPE_ORACLE=PASS races=50000 blocked_subscribers=3 nested=PASS");
     }
 
     private static void twoPhaseRevokesAllBeforeBlockingSubscribers() throws Exception {
@@ -252,8 +257,29 @@ public final class TaskScopeQuiescenceOracle {
                 "physically quiescent cancelled child did not drain");
     }
 
+    private static void nestedCancellationIsTransitive() throws Exception {
+        Scope outer = new Scope();
+        Scope inner = new Scope();
+        Child grandchild = inner.addChild();
+        Child child = outer.addChild(inner::cancelAndQuiesce);
+
+        outer.cancelAndQuiesce();
+
+        check(child.future.isCancelled(), "outer child was not cancelled");
+        check(child.future.isRevoked(), "outer child was not revoked");
+        check(grandchild.future.isCancelled(), "nested grandchild was not cancelled");
+        check(grandchild.future.isRevoked(), "nested grandchild was not revoked");
+        check(!outer.awaitDrain(50, TimeUnit.MILLISECONDS),
+                "outer scope drained before nested physical quiescence");
+
+        inner.markQuiescent(grandchild);
+        check(inner.awaitDrain(5, TimeUnit.SECONDS), "inner scope failed to drain");
+        outer.markQuiescent(child);
+        check(outer.awaitDrain(5, TimeUnit.SECONDS), "outer scope failed to drain after inner scope");
+    }
+
     private static void raceStress() throws Exception {
-        final int rounds = 20_000;
+        final int rounds = 50_000;
         AtomicInteger completed = new AtomicInteger();
         try (ExecutorService pool = Executors.newFixedThreadPool(8)) {
             for (int i = 0; i < rounds; i++) {
