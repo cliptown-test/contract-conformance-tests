@@ -248,6 +248,12 @@ public final class ScopedReadPermitOracle {
             boolean tryIssue() {
                 return issued.compareAndSet(false, true);
             }
+
+            void rollbackIssue() {
+                if (!issued.compareAndSet(true, false)) {
+                    throw new IllegalStateException("claim rollback lost issuance");
+                }
+            }
         }
 
         private static final class LeaseChild {
@@ -295,6 +301,35 @@ public final class ScopedReadPermitOracle {
             }
             lease.readers++;
             return child;
+        }
+
+
+        synchronized void rejectAdmission(
+                LeaseClaim claim, boolean corruptRollback) {
+            LeaseChild child = fork(claim);
+            if (corruptRollback) {
+                // Model an internal accounting failure discovered after
+                // authority issuance but before scheduler admission. Nothing
+                // may be recycled because rollback cannot be proved.
+                child.terminal = true;
+                child.quiescent = true;
+                child.retirementClaimed = true;
+                poisoned = true;
+                publishPoisonIfPhysicallyQuiescent();
+                throw new ScopePoison(
+                        new IllegalStateException("failed admission rollback corrupt"));
+            }
+
+            RegionLease lease = regions.get(child.proof().regionId());
+            if (lease == null
+                    || lease.generation != child.proof().generation()
+                    || lease.readers <= 0
+                    || !liveChildren.remove(child)) {
+                throw new AssertionError("clean admission rollback lost authority state");
+            }
+            lease.readers--;
+            if (lease.readers == 0) regions.remove(child.proof().regionId());
+            claim.rollbackIssue();
         }
 
         synchronized void terminal(LeaseChild child) {
@@ -428,6 +463,7 @@ public final class ScopedReadPermitOracle {
         runtimeLeaseSurvivesLogicalCancellationUntilPhysicalQuiescence();
         concurrentReadersShareGenerationAndRejectMismatchAtomically();
         oneClaimCannotRaceAcrossTwoScopes();
+        failedAdmissionRollbackIsAtomicOrPoisoned();
         retirementCorruptionPoisonsJoinWitness();
         poisonWaitsForSiblingPhysicalQuiescence();
         poisonIsNotGuestRecoverable();
@@ -438,7 +474,7 @@ public final class ScopedReadPermitOracle {
                 + "suspension=PASS exact_binding=PASS nested_ticket=PASS "
                 + "reborrow=PASS deferred=PASS sync=PASS mutation=PASS generation=PASS stale=PASS "
                 + "lifetime=PASS live_generation=PASS readers=PASS "
-                + "claim_identity=PASS aba=PASS cross_scope=PASS "
+                + "claim_identity=PASS aba=PASS cross_scope=PASS admission_rollback=PASS "
                 + "poison=PASS poison_barrier=PASS poison_healthy_retire=PASS "
                 + "poison_unmaskable=PASS checked_wrapper=PASS fatal_cleanup=PASS "
                 + "resume_guard=PASS");
@@ -680,6 +716,44 @@ public final class ScopedReadPermitOracle {
             Thread.currentThread().interrupt();
             throw new AssertionError(interrupted);
         }
+    }
+
+
+    private static void failedAdmissionRollbackIsAtomicOrPoisoned() {
+        Proof cleanProof =
+                new Proof("clean", Mode.SCOPED_READ_BORROW, 119L, 0L, "$");
+        LeaseScope.LeaseClaim clean = new LeaseScope.LeaseClaim(cleanProof);
+        LeaseScope cleanScope = new LeaseScope();
+        cleanScope.rejectAdmission(clean, false);
+        check(!clean.issued.get(),
+                "clean admission rejection did not recycle unestablished claim");
+        check(cleanScope.readers(119L) == 0,
+                "clean admission rejection leaked region readers");
+        check(cleanScope.liveChildren() == 0,
+                "clean admission rejection leaked forensic child");
+
+        Proof corruptProof =
+                new Proof("corrupt", Mode.SCOPED_READ_BORROW, 120L, 0L, "$");
+        LeaseScope.LeaseClaim corrupt = new LeaseScope.LeaseClaim(corruptProof);
+        LeaseScope corruptScope = new LeaseScope();
+        ScopePoison observed = null;
+        try {
+            corruptScope.rejectAdmission(corrupt, true);
+        } catch (ScopePoison poison) {
+            observed = poison;
+        }
+        check(observed != null,
+                "corrupt admission rollback did not surface structured poison");
+        check(corruptScope.isPoisoned(),
+                "corrupt admission rollback did not poison scope");
+        check(corrupt.issued.get(),
+                "corrupt admission rollback recycled one-shot authority");
+        check(corruptScope.readers(120L) == 1,
+                "corrupt admission rollback released unproved region authority");
+        check(corruptScope.liveChildren() == 1,
+                "corrupt admission rollback did not pin forensic child");
+        check(corruptScope.poisonFailurePublished(),
+                "carrier-free corrupt admission rollback did not settle poison barrier");
     }
 
     private static void retirementCorruptionPoisonsJoinWitness() {
