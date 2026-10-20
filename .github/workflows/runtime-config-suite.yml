@@ -62,10 +62,16 @@ jobs:
           distribution: temurin
           java-version: "21"
 
-      - name: Compile source-free structured-task oracle
+      - name: Compile source-free structured-task and permit oracles
         run: |
           mkdir -p build/task-scope-oracle
-          javac --release 21 -Xlint:all -Werror             -d build/task-scope-oracle             canary/TaskScopeQuiescenceOracle.java
+          javac --release 21 -Xlint:all -Werror \
+            -d build/task-scope-oracle \
+            canary/TaskScopeQuiescenceOracle.java \
+            canary/ExecutionPermitOracle.java
 
       - name: Run source-free structured-task oracle
         run: java -ea -cp build/task-scope-oracle canary.TaskScopeQuiescenceOracle
+
+      - name: Run source-free execution-permit oracle
+        run: java -ea -cp build/task-scope-oracle canary.ExecutionPermitOracle
