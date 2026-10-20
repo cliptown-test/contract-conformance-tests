@@ -300,9 +300,9 @@ public final class ScopedReadPermitOracle {
 
         private void retireIfReady(LeaseChild child) {
             if (child.retired || !child.terminal || !child.quiescent) return;
-            RegionLease lease = regions.get(child.proof.regionId());
+            RegionLease lease = regions.get(child.proof().regionId());
             if (lease == null
-                    || lease.generation != child.proof.generation()
+                    || lease.generation != child.proof().generation()
                     || lease.readers <= 0) {
                 throw new AssertionError("lease accounting corrupted");
             }
