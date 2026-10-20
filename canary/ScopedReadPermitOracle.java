@@ -129,11 +129,28 @@ public final class ScopedReadPermitOracle {
         }
     }
 
+    private record RuntimeTicket(long regionId, long generation) {
+        RuntimeTicket {
+            if (regionId <= 0L || generation < 0L) {
+                throw new IllegalArgumentException("invalid runtime ticket");
+            }
+        }
+    }
+
     private static final class Child {
         private final Proof proof;
         private final Region region;
+        private final RuntimeTicket ticket;
 
         Child(Proof proof, Region region, boolean liveStructuredScope) {
+            this(proof, region, liveStructuredScope, null);
+        }
+
+        Child(
+                Proof proof,
+                Region region,
+                boolean liveStructuredScope,
+                RuntimeTicket inheritedTicket) {
             if (proof.mode() != Mode.SCOPED_READ_BORROW) {
                 throw new IllegalArgumentException("read proof required");
             }
@@ -142,7 +159,21 @@ public final class ScopedReadPermitOracle {
             }
             this.proof = proof;
             this.region = region;
+            if (inheritedTicket != null
+                    && (inheritedTicket.regionId() != proof.regionId()
+                        || inheritedTicket.generation() != proof.generation())) {
+                throw new IllegalStateException("nested projection changed region proof");
+            }
+            this.ticket = new RuntimeTicket(proof.regionId(), proof.generation());
             validateGeneration();
+        }
+
+        Child projectNested(Proof nestedProof) {
+            return new Child(nestedProof, region, true, ticket);
+        }
+
+        Borrow derivativeReborrow() {
+            throw new IllegalStateException("derivative reborrow of scoped read authority");
         }
 
         int readBeforeAndAfterSuspension() {
@@ -170,6 +201,8 @@ public final class ScopedReadPermitOracle {
         outsideScopeFails();
         mutableProjectedDeferredAndWriteFail();
         exactBorrowBindingMatters();
+        nestedProjectionPreservesRuntimeTicket();
+        derivativeReborrowFails();
         mutationIsExcludedWhileLoanLives();
         valueAssignmentDoesNotRotateRegionGeneration();
         actualRegionReuseInvalidatesStaleProof();
@@ -177,8 +210,8 @@ public final class ScopedReadPermitOracle {
 
         System.out.println(
                 "SCOPED_READ_PERMIT_ORACLE=PASS "
-                + "suspension=PASS exact_binding=PASS deferred=PASS "
-                + "mutation=PASS generation=PASS stale=PASS");
+                + "suspension=PASS exact_binding=PASS nested_ticket=PASS "
+                + "reborrow=PASS deferred=PASS mutation=PASS generation=PASS stale=PASS");
     }
 
     private static void directReadSurvivesSuspension() {
@@ -225,6 +258,47 @@ public final class ScopedReadPermitOracle {
         expectFailure(() -> scope.validateHiddenDrain(permitted, ordinary));
         permitted.close();
         ordinary.close();
+    }
+
+
+    private static void nestedProjectionPreservesRuntimeTicket() {
+        Region region = new Region(1, 42);
+        Borrow borrow = new Borrow(region, false, false, "$");
+        Scope scope = new Scope();
+        Proof outerProof = scope.authorize("ref", borrow, false, false);
+        Child outer = new Child(outerProof, region, true);
+
+        Proof same = new Proof(
+                "ref",
+                Mode.SCOPED_READ_BORROW,
+                outerProof.regionId(),
+                outerProof.generation(),
+                outerProof.path());
+        Child inner = outer.projectNested(same);
+        check(inner.readBeforeAndAfterSuspension() == 42,
+                "nested ticket read changed");
+
+        Proof mismatch = new Proof(
+                "ref",
+                Mode.SCOPED_READ_BORROW,
+                outerProof.regionId() + 1,
+                outerProof.generation(),
+                outerProof.path());
+        expectFailure(() -> outer.projectNested(mismatch));
+
+        scope.validateHiddenDrain(borrow);
+        borrow.close();
+    }
+
+    private static void derivativeReborrowFails() {
+        Region region = new Region(1, 42);
+        Borrow borrow = new Borrow(region, false, false, "$");
+        Scope scope = new Scope();
+        Proof proof = scope.authorize("ref", borrow, false, false);
+        Child child = new Child(proof, region, true);
+        expectFailure(child::derivativeReborrow);
+        scope.validateHiddenDrain(borrow);
+        borrow.close();
     }
 
     private static void mutationIsExcludedWhileLoanLives() {
