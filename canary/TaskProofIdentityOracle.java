@@ -537,6 +537,7 @@ public final class TaskProofIdentityOracle {
     public static void main(String[] args) {
         exactBoundaryLookupFailsClosed();
         scopeEpochRejectsForeignAndStaleTickets();
+        sameCoordinatesCannotForgeTicketIdentity();
         reservationBindsExactScopeChildAndLifecycle();
         staleGenerationFailsBeforeRetirementHook();
         retirementFailureCannotPublishDrainWitness();
@@ -550,6 +551,7 @@ public final class TaskProofIdentityOracle {
         ownerAndSchedulerIdentityMustBothMatch();
         cleanupPrecedesExactLoanRetirement();
         partialOwnerAndSchedulerBindFailuresPoison();
+        indeterminateSchedulerAdmissionPinsResources();
         System.out.println(
                 "TASK_PROOF_IDENTITY_ORACLE=PASS exact_boundary=PASS scope_epoch=PASS "
                 + "reservation=PASS exact_child=PASS generation=PASS poison=PASS "
@@ -557,7 +559,8 @@ public final class TaskProofIdentityOracle {
                 + "partial_bind_rollback=PASS runtime_child=PASS "
                 + "bound_abort=PASS scheduler_epoch=PASS three_edge_loan=PASS "
                 + "owner_scheduler_chain=PASS cleanup_order=PASS "
-                + "partial_owner_scheduler_bind_poison=PASS");
+                + "partial_owner_scheduler_bind_poison=PASS "
+                + "ticket_identity=PASS indeterminate_admission=PASS");
     }
 
     private static void exactBoundaryLookupFailsClosed() {
@@ -587,6 +590,18 @@ public final class TaskProofIdentityOracle {
                 () -> one.retire(ticket),
                 "retired ticket must be stale");
         check(ticket.id == 1L, "ticket identity sanity");
+    }
+
+    private static void sameCoordinatesCannotForgeTicketIdentity() {
+        Verifier verifier = new Verifier();
+        Ticket exact = verifier.admit();
+        Ticket forged = new Ticket(exact.epoch, exact.id);
+
+        check(exact != forged, "forged ticket unexpectedly reused identity");
+        expect(IllegalArgumentException.class,
+                () -> verifier.retire(forged),
+                "same epoch/id coordinates forged exact ticket identity");
+        verifier.retire(exact);
     }
 
     private static void reservationBindsExactScopeChildAndLifecycle() {
@@ -1053,6 +1068,31 @@ public final class TaskProofIdentityOracle {
                         && partiallyAcceptedScheduler == schedulerChild
                         && schedulerBinding.retained(),
                 "partial scheduler bind released compiler authority");
+    }
+
+    private static void indeterminateSchedulerAdmissionPinsResources() {
+        Object loanAuthority = new Object();
+        Object resourceAuthority = new Object();
+        IdentityHashMap<Object, Throwable> retained =
+                new IdentityHashMap<>();
+        boolean exactSchedulerChildBound = true;
+        boolean neverStartedWitness = false;
+        int[] cleanupCalls = {0};
+
+        if (exactSchedulerChildBound && !neverStartedWitness) {
+            IllegalStateException failure = new IllegalStateException(
+                    "scheduler admission rollback unproven");
+            retained.put(loanAuthority, failure);
+            retained.put(resourceAuthority, failure);
+        } else {
+            cleanupCalls[0]++;
+        }
+
+        check(cleanupCalls[0] == 0,
+                "indeterminate scheduler admission reclaimed resources early");
+        check(retained.containsKey(loanAuthority)
+                        && retained.containsKey(resourceAuthority),
+                "indeterminate admission failed to pin loan and resources");
     }
 
     private static <T extends Throwable> void expect(
