@@ -231,6 +231,7 @@ public final class ScopedReadPermitOracle {
             boolean quiescent;
             boolean retirementClaimed;
             boolean retired;
+            boolean cancelled;
 
             LeaseChild(LeaseClaim claim) {
                 this.claim = claim;
@@ -245,6 +246,7 @@ public final class ScopedReadPermitOracle {
         private final Set<LeaseChild> liveChildren =
                 Collections.newSetFromMap(new IdentityHashMap<>());
         private boolean poisoned;
+        private boolean poisonFailurePublished;
 
         synchronized LeaseChild fork(LeaseClaim claim) {
             Proof proof = claim.proof;
@@ -272,12 +274,12 @@ public final class ScopedReadPermitOracle {
 
         synchronized void terminal(LeaseChild child) {
             child.terminal = true;
-            retireIfReady(child);
+            lifecycleChanged(child);
         }
 
         synchronized void quiescent(LeaseChild child) {
             child.quiescent = true;
-            retireIfReady(child);
+            lifecycleChanged(child);
         }
 
         synchronized boolean hasLease(long regionId, long generation) {
@@ -314,6 +316,42 @@ public final class ScopedReadPermitOracle {
 
         synchronized boolean canPublishDrainWitness() {
             return !poisoned && liveChildren.isEmpty();
+        }
+
+        synchronized boolean poisonFailurePublished() {
+            return poisonFailurePublished;
+        }
+
+        synchronized boolean cancelled(LeaseChild child) {
+            return child.cancelled;
+        }
+
+        private void lifecycleChanged(LeaseChild child) {
+            if (poisoned) {
+                publishPoisonIfPhysicallyQuiescent();
+                return;
+            }
+            retireIfReady(child);
+            if (poisoned) {
+                // Poison revokes every remaining child logically, but physical
+                // carrier exit is still required before the failed drain becomes
+                // observable.
+                for (LeaseChild remaining : liveChildren) {
+                    if (!remaining.terminal) {
+                        remaining.cancelled = true;
+                        remaining.terminal = true;
+                    }
+                }
+                publishPoisonIfPhysicallyQuiescent();
+            }
+        }
+
+        private void publishPoisonIfPhysicallyQuiescent() {
+            if (!poisoned || poisonFailurePublished) return;
+            for (LeaseChild child : liveChildren) {
+                if (!child.terminal || !child.quiescent) return;
+            }
+            poisonFailurePublished = true;
         }
 
         private void retireIfReady(LeaseChild child) {
@@ -361,6 +399,7 @@ public final class ScopedReadPermitOracle {
         concurrentReadersShareGenerationAndRejectMismatchAtomically();
         oneClaimCannotRaceAcrossTwoScopes();
         retirementCorruptionPoisonsJoinWitness();
+        poisonWaitsForSiblingPhysicalQuiescence();
         ownedProofCarriesNoAuthority();
 
         System.out.println(
@@ -369,7 +408,7 @@ public final class ScopedReadPermitOracle {
                 + "reborrow=PASS deferred=PASS mutation=PASS generation=PASS stale=PASS "
                 + "lifetime=PASS live_generation=PASS readers=PASS "
                 + "claim_identity=PASS aba=PASS cross_scope=PASS "
-                + "poison=PASS resume_guard=PASS");
+                + "poison=PASS poison_barrier=PASS resume_guard=PASS");
     }
 
     private static void directReadSurvivesSuspension() {
@@ -625,6 +664,33 @@ public final class ScopedReadPermitOracle {
                 "poisoned memory authority manufactured a drain witness");
         check(claim.issued.get(),
                 "failed physical retirement resurrected one-shot claim");
+    }
+
+    private static void poisonWaitsForSiblingPhysicalQuiescence() {
+        LeaseScope scope = new LeaseScope();
+        LeaseScope.LeaseChild corrupt = scope.fork(
+                new LeaseScope.LeaseClaim(new Proof(
+                        "corrupt", Mode.SCOPED_READ_BORROW, 127L, 0L, "$")));
+        LeaseScope.LeaseChild sibling = scope.fork(
+                new LeaseScope.LeaseClaim(new Proof(
+                        "sibling", Mode.SCOPED_READ_BORROW, 128L, 0L, "$")));
+
+        scope.terminal(corrupt);
+        scope.terminal(sibling);
+        scope.corruptRegionForTest(127L);
+        scope.quiescent(corrupt);
+
+        check(scope.isPoisoned(), "corrupt retirement did not poison scope");
+        check(scope.cancelled(sibling),
+                "poison did not revoke sibling logical authority");
+        check(!scope.poisonFailurePublished(),
+                "poison failure became visible before sibling physical quiescence");
+
+        scope.quiescent(sibling);
+        check(scope.poisonFailurePublished(),
+                "poison failure did not publish after every carrier quiesced");
+        check(!scope.canPublishDrainWitness(),
+                "poisoned scope manufactured a success witness");
     }
 
     private static void ownedProofCarriesNoAuthority() {
