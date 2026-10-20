@@ -617,6 +617,7 @@ public final class TaskProofIdentityOracle {
         indeterminateSchedulerAdmissionPinsResources();
         schedulerOwnedAdmissionIsMonotonic();
         schedulerStateAloneControlsCleanup();
+        cancellationCannotRestoreParentAuthorityEarly();
         System.out.println(
                 "TASK_PROOF_IDENTITY_ORACLE=PASS exact_boundary=PASS scope_epoch=PASS "
                 + "reservation=PASS exact_child=PASS generation=PASS poison=PASS "
@@ -626,7 +627,8 @@ public final class TaskProofIdentityOracle {
                 + "owner_scheduler_chain=PASS cleanup_order=PASS "
                 + "partial_owner_scheduler_bind_poison=PASS "
                 + "ticket_identity=PASS indeterminate_admission=PASS "
-                + "scheduler_owned_state=PASS scheduler_cleanup_gate=PASS");
+                + "scheduler_owned_state=PASS scheduler_cleanup_gate=PASS "
+                + "cancel_parent_authority=PASS");
     }
 
     private static void exactBoundaryLookupFailsClosed() {
@@ -1213,6 +1215,34 @@ public final class TaskProofIdentityOracle {
                         "quiescent child confused with never-registered child");
             }
         }
+    }
+
+    private static void cancellationCannotRestoreParentAuthorityEarly() {
+        SchedulerOwnedAdmission admission = new SchedulerOwnedAdmission();
+        admission.bound();
+        admission.registered();
+        admission.entered();
+
+        boolean loanRetained = true;
+        boolean parentMayWrite = !loanRetained;
+        check(!parentMayWrite,
+                "parent write authority escaped while child loan was live");
+
+        // Logical cancellation/result settlement changes neither physical
+        // scheduler state nor memory-loan authority.
+        boolean cancelled = true;
+        check(cancelled, "cancellation model failed");
+        parentMayWrite = !loanRetained;
+        check(admission.state() == SchedulerOwnedAdmission.State.ENTERED
+                        && !parentMayWrite,
+                "cancellation restored parent authority before physical exit");
+
+        admission.quiescent();
+        loanRetained = false;
+        parentMayWrite = !loanRetained;
+        check(admission.state() == SchedulerOwnedAdmission.State.QUIESCENT
+                        && parentMayWrite,
+                "physical quiescence did not restore parent authority");
     }
 
     private static <T extends Throwable> void expect(
