@@ -223,10 +223,15 @@ public final class ScopedReadPermitOracle {
         private final Map<Long, RegionLease> regions = new HashMap<>();
         private final Set<LeaseChild> liveChildren =
                 Collections.newSetFromMap(new IdentityHashMap<>());
+        private final Set<Proof> issuedProofs =
+                Collections.newSetFromMap(new IdentityHashMap<>());
 
         synchronized LeaseChild fork(Proof proof) {
             if (proof.mode() != Mode.SCOPED_READ_BORROW || !"$".equals(proof.path())) {
                 throw new IllegalArgumentException("whole-region read proof required");
+            }
+            if (issuedProofs.contains(proof)) {
+                throw new IllegalStateException("scoped read proof identity already issued");
             }
             RegionLease existing = regions.get(proof.regionId());
             if (existing != null && existing.generation != proof.generation()) {
@@ -236,8 +241,8 @@ public final class ScopedReadPermitOracle {
                     proof.regionId(),
                     ignored -> new RegionLease(proof.generation()));
             LeaseChild child = new LeaseChild(proof);
-            if (!liveChildren.add(child)) {
-                throw new AssertionError("duplicate lease child identity");
+            if (!issuedProofs.add(proof) || !liveChildren.add(child)) {
+                throw new AssertionError("duplicate lease identity");
             }
             lease.readers++;
             return child;
@@ -309,7 +314,7 @@ public final class ScopedReadPermitOracle {
                 + "suspension=PASS exact_binding=PASS nested_ticket=PASS "
                 + "reborrow=PASS deferred=PASS mutation=PASS generation=PASS stale=PASS "
                 + "lifetime=PASS live_generation=PASS readers=PASS "
-                + "claim_identity=PASS resume_guard=PASS");
+                + "claim_identity=PASS aba=PASS resume_guard=PASS");
     }
 
     private static void directReadSurvivesSuspension() {
@@ -452,8 +457,8 @@ public final class ScopedReadPermitOracle {
     }
 
     private static void concurrentReadersShareGenerationAndRejectMismatchAtomically() {
-        Proof left = new Proof("left", Mode.SCOPED_READ_BORROW, 91L, 2L, "$");
-        Proof right = new Proof("right", Mode.SCOPED_READ_BORROW, 91L, 2L, "$");
+        Proof left = new Proof("view", Mode.SCOPED_READ_BORROW, 91L, 2L, "$");
+        Proof right = new Proof("view", Mode.SCOPED_READ_BORROW, 91L, 2L, "$");
         Proof stale = new Proof("stale", Mode.SCOPED_READ_BORROW, 91L, 3L, "$");
         LeaseScope scope = new LeaseScope();
 
@@ -475,6 +480,7 @@ public final class ScopedReadPermitOracle {
                 "aggregate region should remain live for sibling");
         expectFailure(() -> scope.requireLiveForResume(a));
         scope.requireLiveForResume(b);
+        expectFailure(() -> scope.fork(left));
 
         scope.quiescent(b);
         scope.terminal(b);
