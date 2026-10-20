@@ -336,6 +336,10 @@ public final class ScopedReadPermitOracle {
 
         private void lifecycleChanged(LeaseChild child) {
             if (poisoned) {
+                // Keep only the child whose retirement actually failed pinned.
+                // Healthy siblings must retire their exact lease identities once
+                // they are terminal + physically quiescent.
+                retireIfReady(child);
                 publishPoisonIfPhysicallyQuiescent();
                 return;
             }
@@ -417,8 +421,8 @@ public final class ScopedReadPermitOracle {
                 + "reborrow=PASS deferred=PASS mutation=PASS generation=PASS stale=PASS "
                 + "lifetime=PASS live_generation=PASS readers=PASS "
                 + "claim_identity=PASS aba=PASS cross_scope=PASS "
-                + "poison=PASS poison_barrier=PASS poison_unmaskable=PASS "
-                + "resume_guard=PASS");
+                + "poison=PASS poison_barrier=PASS poison_healthy_retire=PASS "
+                + "poison_unmaskable=PASS checked_wrapper=PASS resume_guard=PASS");
     }
 
     private static void directReadSurvivesSuspension() {
@@ -698,6 +702,10 @@ public final class ScopedReadPermitOracle {
         scope.quiescent(sibling);
         check(scope.poisonFailurePublished(),
                 "poison failure did not publish after every carrier quiesced");
+        check(scope.liveChildren() == 1,
+                "healthy sibling remained pinned after physical quiescence");
+        check(scope.readers(128L) == 0,
+                "healthy sibling's stale lease remained live under poison");
         check(!scope.canPublishDrainWitness(),
                 "poisoned scope manufactured a success witness");
     }
@@ -717,6 +725,15 @@ public final class ScopedReadPermitOracle {
         suppressed.addSuppressed(poison);
         check(!guestRecoverable(suppressed),
                 "suppressed poison became guest recoverable");
+
+        Exception checkedCause = new Exception("checked wrapper", poison);
+        check(!guestRecoverable(checkedCause),
+                "checked cause wrapper made poison guest recoverable");
+
+        Exception checkedSuppressed = new Exception("checked cleanup wrapper");
+        checkedSuppressed.addSuppressed(poison);
+        check(!guestRecoverable(checkedSuppressed),
+                "checked suppressed wrapper made poison guest recoverable");
     }
 
     private static boolean guestRecoverable(Throwable failure) {
