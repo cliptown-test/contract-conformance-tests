@@ -5,7 +5,10 @@ import java.util.HashMap;
 import java.util.IdentityHashMap;
 import java.util.Map;
 import java.util.Set;
-import java.util.concurrent.atomic.AtomicLong;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
 
 /**
  * Independent JDK-only semantic oracle for compiler-issued scoped read permits.
@@ -209,40 +212,57 @@ public final class ScopedReadPermitOracle {
             }
         }
 
-        private static final class LeaseChild {
+        private static final class LeaseClaim {
             final Proof proof;
+            final AtomicBoolean issued = new AtomicBoolean();
+
+            LeaseClaim(Proof proof) {
+                this.proof = proof;
+            }
+
+            boolean tryIssue() {
+                return issued.compareAndSet(false, true);
+            }
+        }
+
+        private static final class LeaseChild {
+            final LeaseClaim claim;
             boolean terminal;
             boolean quiescent;
             boolean retired;
 
-            LeaseChild(Proof proof) {
-                this.proof = proof;
+            LeaseChild(LeaseClaim claim) {
+                this.claim = claim;
+            }
+
+            Proof proof() {
+                return claim.proof;
             }
         }
 
         private final Map<Long, RegionLease> regions = new HashMap<>();
         private final Set<LeaseChild> liveChildren =
                 Collections.newSetFromMap(new IdentityHashMap<>());
-        private final Set<Proof> issuedProofs =
-                Collections.newSetFromMap(new IdentityHashMap<>());
 
-        synchronized LeaseChild fork(Proof proof) {
+        synchronized LeaseChild fork(LeaseClaim claim) {
+            Proof proof = claim.proof;
             if (proof.mode() != Mode.SCOPED_READ_BORROW || !"$".equals(proof.path())) {
                 throw new IllegalArgumentException("whole-region read proof required");
-            }
-            if (issuedProofs.contains(proof)) {
-                throw new IllegalStateException("scoped read proof identity already issued");
             }
             RegionLease existing = regions.get(proof.regionId());
             if (existing != null && existing.generation != proof.generation()) {
                 throw new IllegalStateException("stale live generation");
             }
+            if (!claim.tryIssue()) {
+                throw new IllegalStateException("scoped read claim identity already issued");
+            }
+
             RegionLease lease = regions.computeIfAbsent(
                     proof.regionId(),
                     ignored -> new RegionLease(proof.generation()));
-            LeaseChild child = new LeaseChild(proof);
-            if (!issuedProofs.add(proof) || !liveChildren.add(child)) {
-                throw new AssertionError("duplicate lease identity");
+            LeaseChild child = new LeaseChild(claim);
+            if (!liveChildren.add(child)) {
+                throw new AssertionError("duplicate lease child identity");
             }
             lease.readers++;
             return child;
@@ -272,7 +292,7 @@ public final class ScopedReadPermitOracle {
 
         synchronized void requireLiveForResume(LeaseChild child) {
             if (!liveChildren.contains(child)
-                    || !hasLease(child.proof.regionId(), child.proof.generation())) {
+                    || !hasLease(child.proof().regionId(), child.proof().generation())) {
                 throw new IllegalStateException(
                         "scoped read continuation resumed without its exact live lease");
             }
@@ -307,6 +327,7 @@ public final class ScopedReadPermitOracle {
         actualRegionReuseInvalidatesStaleProof();
         runtimeLeaseSurvivesLogicalCancellationUntilPhysicalQuiescence();
         concurrentReadersShareGenerationAndRejectMismatchAtomically();
+        oneClaimCannotRaceAcrossTwoScopes();
         ownedProofCarriesNoAuthority();
 
         System.out.println(
@@ -314,7 +335,8 @@ public final class ScopedReadPermitOracle {
                 + "suspension=PASS exact_binding=PASS nested_ticket=PASS "
                 + "reborrow=PASS deferred=PASS mutation=PASS generation=PASS stale=PASS "
                 + "lifetime=PASS live_generation=PASS readers=PASS "
-                + "claim_identity=PASS aba=PASS resume_guard=PASS");
+                + "claim_identity=PASS aba=PASS cross_scope=PASS "
+                + "resume_guard=PASS");
     }
 
     private static void directReadSurvivesSuspension() {
@@ -440,7 +462,8 @@ public final class ScopedReadPermitOracle {
     private static void runtimeLeaseSurvivesLogicalCancellationUntilPhysicalQuiescence() {
         Proof proof = new Proof("view", Mode.SCOPED_READ_BORROW, 77L, 4L, "$");
         LeaseScope scope = new LeaseScope();
-        LeaseScope.LeaseChild child = scope.fork(proof);
+        LeaseScope.LeaseClaim claim = new LeaseScope.LeaseClaim(proof);
+        LeaseScope.LeaseChild child = scope.fork(claim);
 
         check(scope.hasLease(77L, 4L), "lease missing after admission");
         scope.terminal(child);
@@ -457,9 +480,12 @@ public final class ScopedReadPermitOracle {
     }
 
     private static void concurrentReadersShareGenerationAndRejectMismatchAtomically() {
-        Proof left = new Proof("view", Mode.SCOPED_READ_BORROW, 91L, 2L, "$");
-        Proof right = new Proof("view", Mode.SCOPED_READ_BORROW, 91L, 2L, "$");
-        Proof stale = new Proof("stale", Mode.SCOPED_READ_BORROW, 91L, 3L, "$");
+        Proof leftProof = new Proof("view", Mode.SCOPED_READ_BORROW, 91L, 2L, "$");
+        Proof rightProof = new Proof("view", Mode.SCOPED_READ_BORROW, 91L, 2L, "$");
+        Proof staleProof = new Proof("stale", Mode.SCOPED_READ_BORROW, 91L, 3L, "$");
+        LeaseScope.LeaseClaim left = new LeaseScope.LeaseClaim(leftProof);
+        LeaseScope.LeaseClaim right = new LeaseScope.LeaseClaim(rightProof);
+        LeaseScope.LeaseClaim stale = new LeaseScope.LeaseClaim(staleProof);
         LeaseScope scope = new LeaseScope();
 
         LeaseScope.LeaseChild a = scope.fork(left);
@@ -467,6 +493,8 @@ public final class ScopedReadPermitOracle {
         check(scope.readers(91L) == 2, "shared readers were not counted");
 
         expectFailure(() -> scope.fork(stale));
+        check(!stale.issued.get(),
+                "generation rejection consumed a never-admitted claim");
         check(scope.readers(91L) == 2,
                 "rejected generation mismatch mutated live reader authority");
         check(scope.hasLease(91L, 2L), "valid generation disappeared");
@@ -486,6 +514,58 @@ public final class ScopedReadPermitOracle {
         scope.terminal(b);
         check(scope.readers(91L) == 0,
                 "last sibling retirement leaked read authority");
+    }
+
+    private static void oneClaimCannotRaceAcrossTwoScopes() {
+        Proof proof = new Proof("view", Mode.SCOPED_READ_BORROW, 101L, 0L, "$");
+        LeaseScope.LeaseClaim claim = new LeaseScope.LeaseClaim(proof);
+        LeaseScope left = new LeaseScope();
+        LeaseScope right = new LeaseScope();
+        CountDownLatch ready = new CountDownLatch(2);
+        CountDownLatch start = new CountDownLatch(1);
+        AtomicInteger admitted = new AtomicInteger();
+        AtomicInteger rejected = new AtomicInteger();
+
+        Runnable leftAttempt = () -> raceClaim(left, claim, ready, start, admitted, rejected);
+        Runnable rightAttempt = () -> raceClaim(right, claim, ready, start, admitted, rejected);
+        Thread a = Thread.ofVirtual().start(leftAttempt);
+        Thread b = Thread.ofVirtual().start(rightAttempt);
+
+        try {
+            check(ready.await(5, TimeUnit.SECONDS), "claim race did not become ready");
+            start.countDown();
+            a.join();
+            b.join();
+        } catch (InterruptedException interrupted) {
+            Thread.currentThread().interrupt();
+            throw new AssertionError(interrupted);
+        }
+
+        check(admitted.get() == 1, "claim race admitted " + admitted.get());
+        check(rejected.get() == 1, "claim race rejected " + rejected.get());
+        check(claim.issued.get(), "winning claim did not remain one-shot consumed");
+    }
+
+    private static void raceClaim(
+            LeaseScope scope,
+            LeaseScope.LeaseClaim claim,
+            CountDownLatch ready,
+            CountDownLatch start,
+            AtomicInteger admitted,
+            AtomicInteger rejected) {
+        ready.countDown();
+        try {
+            if (!start.await(5, TimeUnit.SECONDS)) {
+                throw new AssertionError("claim race start timeout");
+            }
+            scope.fork(claim);
+            admitted.incrementAndGet();
+        } catch (IllegalStateException expected) {
+            rejected.incrementAndGet();
+        } catch (InterruptedException interrupted) {
+            Thread.currentThread().interrupt();
+            throw new AssertionError(interrupted);
+        }
     }
 
     private static void ownedProofCarriesNoAuthority() {
