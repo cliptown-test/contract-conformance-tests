@@ -80,13 +80,24 @@ public final class ScopedReadPermitOracle {
         final boolean mutable;
         final boolean projected;
         final String path;
+        final boolean syncSafe;
         boolean live = true;
 
         Borrow(Region region, boolean mutable, boolean projected, String path) {
+            this(region, mutable, projected, path, true);
+        }
+
+        Borrow(
+                Region region,
+                boolean mutable,
+                boolean projected,
+                String path,
+                boolean syncSafe) {
             this.region = region;
             this.mutable = mutable;
             this.projected = projected;
             this.path = path;
+            this.syncSafe = syncSafe;
             if (mutable) throw new IllegalArgumentException("oracle phase is read-only only");
             region.immutableLoans++;
         }
@@ -115,6 +126,7 @@ public final class ScopedReadPermitOracle {
             if (borrow == null || !borrow.live) throw new IllegalStateException("dead borrow");
             if (deferredExecution) throw new IllegalStateException("deferred execution");
             if (borrow.mutable || write) throw new IllegalStateException("mutable/write");
+            if (!borrow.syncSafe) throw new IllegalStateException("non-Sync referent");
             if (borrow.projected) throw new IllegalStateException("projected");
             if (!"$".equals(borrow.path)) throw new IllegalStateException("path");
 
@@ -401,6 +413,7 @@ public final class ScopedReadPermitOracle {
         directReadSurvivesSuspension();
         outsideScopeFails();
         mutableProjectedDeferredAndWriteFail();
+        nonSyncSharedBorrowFails();
         exactBorrowBindingMatters();
         nestedProjectionPreservesRuntimeTicket();
         derivativeReborrowFails();
@@ -418,7 +431,7 @@ public final class ScopedReadPermitOracle {
         System.out.println(
                 "SCOPED_READ_PERMIT_ORACLE=PASS "
                 + "suspension=PASS exact_binding=PASS nested_ticket=PASS "
-                + "reborrow=PASS deferred=PASS mutation=PASS generation=PASS stale=PASS "
+                + "reborrow=PASS deferred=PASS sync=PASS mutation=PASS generation=PASS stale=PASS "
                 + "lifetime=PASS live_generation=PASS readers=PASS "
                 + "claim_identity=PASS aba=PASS cross_scope=PASS "
                 + "poison=PASS poison_barrier=PASS poison_healthy_retire=PASS "
@@ -458,6 +471,15 @@ public final class ScopedReadPermitOracle {
         expectFailure(() -> scope.authorize("deferred", direct, false, true));
         expectFailure(() -> scope.authorize("write", direct, true, false));
         direct.close();
+    }
+
+
+    private static void nonSyncSharedBorrowFails() {
+        Region region = new Region(1, 42);
+        Borrow nonSync = new Borrow(region, false, false, "$", false);
+        Scope scope = new Scope();
+        expectFailure(() -> scope.authorize("futureView", nonSync, false, false));
+        nonSync.close();
     }
 
     private static void exactBorrowBindingMatters() {
