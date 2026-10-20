@@ -549,13 +549,15 @@ public final class TaskProofIdentityOracle {
         threeEdgeLoanLifecycleRejectsChildlessBypass();
         ownerAndSchedulerIdentityMustBothMatch();
         cleanupPrecedesExactLoanRetirement();
+        partialOwnerAndSchedulerBindFailuresPoison();
         System.out.println(
                 "TASK_PROOF_IDENTITY_ORACLE=PASS exact_boundary=PASS scope_epoch=PASS "
                 + "reservation=PASS exact_child=PASS generation=PASS poison=PASS "
                 + "pre_dispatch_poison=PASS partial_bind_poison=PASS "
                 + "partial_bind_rollback=PASS runtime_child=PASS "
                 + "bound_abort=PASS scheduler_epoch=PASS three_edge_loan=PASS "
-                + "owner_scheduler_chain=PASS cleanup_order=PASS");
+                + "owner_scheduler_chain=PASS cleanup_order=PASS "
+                + "partial_owner_scheduler_bind_poison=PASS");
     }
 
     private static void exactBoundaryLookupFailsClosed() {
@@ -1017,6 +1019,40 @@ public final class TaskProofIdentityOracle {
                 "cleanup failure returned exact memory loan");
         check("physical>cleanup>".contentEquals(order),
                 "loan retirement occurred after failed cleanup");
+    }
+
+    private static void partialOwnerAndSchedulerBindFailuresPoison() {
+        Object scope = new Object();
+        Object owner = new Object();
+        Object schedulerChild = new Object();
+
+        boolean ownerAuthorityPoisoned = false;
+        Object partiallyAcceptedOwner = null;
+        try {
+            partiallyAcceptedOwner = owner;
+            throw new IllegalStateException("owner bind failed after accept");
+        } catch (IllegalStateException expected) {
+            ownerAuthorityPoisoned = true;
+        }
+        check(ownerAuthorityPoisoned && partiallyAcceptedOwner == owner,
+                "partial owner bind was treated as clean rollback");
+
+        OwnerSchedulerLoan schedulerBinding = new OwnerSchedulerLoan();
+        schedulerBinding.bindScope(scope);
+        schedulerBinding.bindOwner(scope, owner);
+        boolean schedulerAuthorityPoisoned = false;
+        Object partiallyAcceptedScheduler = null;
+        try {
+            partiallyAcceptedScheduler = schedulerChild;
+            throw new IllegalStateException(
+                    "scheduler bind failed after accept");
+        } catch (IllegalStateException expected) {
+            schedulerAuthorityPoisoned = true;
+        }
+        check(schedulerAuthorityPoisoned
+                        && partiallyAcceptedScheduler == schedulerChild
+                        && schedulerBinding.retained(),
+                "partial scheduler bind released compiler authority");
     }
 
     private static <T extends Throwable> void expect(
