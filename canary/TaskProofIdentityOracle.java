@@ -420,6 +420,120 @@ public final class TaskProofIdentityOracle {
         }
     }
 
+    private static final class OwnerSchedulerLoan {
+        private enum State {
+            MINTED,
+            SCOPE_BOUND,
+            OWNER_BOUND,
+            SCHEDULER_BOUND,
+            RETIRED
+        }
+
+        private State state = State.MINTED;
+        private Object scope;
+        private Object owner;
+        private Object schedulerChild;
+        private boolean retained = true;
+
+        void bindScope(Object exactScope) {
+            Objects.requireNonNull(exactScope, "scope");
+            if (state != State.MINTED) {
+                throw new IllegalStateException("scope already bound");
+            }
+            scope = exactScope;
+            state = State.SCOPE_BOUND;
+        }
+
+        void bindOwner(Object exactScope, Object exactOwner) {
+            requireScope(exactScope);
+            Objects.requireNonNull(exactOwner, "owner");
+            if (state != State.SCOPE_BOUND) {
+                throw new IllegalStateException("owner bind requires scope-only state");
+            }
+            owner = exactOwner;
+            state = State.OWNER_BOUND;
+        }
+
+        void bindSchedulerChild(
+                Object exactScope, Object exactOwner, Object exactSchedulerChild) {
+            requireScope(exactScope);
+            Objects.requireNonNull(exactOwner, "owner");
+            Objects.requireNonNull(exactSchedulerChild, "scheduler child");
+            if (state != State.OWNER_BOUND || owner != exactOwner) {
+                throw new IllegalArgumentException(
+                        "scheduler bind requires exact owner");
+            }
+            schedulerChild = exactSchedulerChild;
+            state = State.SCHEDULER_BOUND;
+        }
+
+        void retireBeforeOwner(Object exactScope) {
+            requireScope(exactScope);
+            if (state != State.SCOPE_BOUND || owner != null
+                    || schedulerChild != null) {
+                throw new IllegalStateException(
+                        "pre-owner retirement requires scope-only state");
+            }
+            retire();
+        }
+
+        void retireBeforeScheduler(Object exactScope, Object exactOwner) {
+            requireScope(exactScope);
+            if (state != State.OWNER_BOUND || owner != exactOwner
+                    || schedulerChild != null) {
+                throw new IllegalArgumentException(
+                        "pre-scheduler retirement requires exact owner");
+            }
+            retire();
+        }
+
+        void retireNeverStarted(
+                Object exactScope, Object exactOwner, Object exactSchedulerChild) {
+            requireExactScheduler(
+                    exactScope, exactOwner, exactSchedulerChild);
+            retire();
+        }
+
+        void retirePhysical(
+                Object exactScope, Object exactOwner, Object exactSchedulerChild) {
+            requireExactScheduler(
+                    exactScope, exactOwner, exactSchedulerChild);
+            retire();
+        }
+
+        boolean retained() {
+            return retained;
+        }
+
+        private void requireExactScheduler(
+                Object exactScope, Object exactOwner, Object exactSchedulerChild) {
+            requireScope(exactScope);
+            if (state != State.SCHEDULER_BOUND
+                    || owner != exactOwner
+                    || schedulerChild != exactSchedulerChild) {
+                throw new IllegalArgumentException(
+                        "retirement requires exact owner and scheduler child");
+            }
+        }
+
+        private void requireScope(Object exactScope) {
+            Objects.requireNonNull(exactScope, "scope");
+            if (scope != exactScope) {
+                throw new IllegalArgumentException("scope mismatch");
+            }
+            if (state == State.MINTED || state == State.RETIRED) {
+                throw new IllegalStateException("loan not live");
+            }
+        }
+
+        private void retire() {
+            retained = false;
+            owner = null;
+            schedulerChild = null;
+            state = State.RETIRED;
+        }
+    }
+
     public static void main(String[] args) {
         exactBoundaryLookupFailsClosed();
         scopeEpochRejectsForeignAndStaleTickets();
@@ -433,12 +547,15 @@ public final class TaskProofIdentityOracle {
         boundLeaseCannotBeAbortedByOuterFailure();
         crossSchedulerChildCannotRetireAuthority();
         threeEdgeLoanLifecycleRejectsChildlessBypass();
+        ownerAndSchedulerIdentityMustBothMatch();
+        cleanupPrecedesExactLoanRetirement();
         System.out.println(
                 "TASK_PROOF_IDENTITY_ORACLE=PASS exact_boundary=PASS scope_epoch=PASS "
                 + "reservation=PASS exact_child=PASS generation=PASS poison=PASS "
                 + "pre_dispatch_poison=PASS partial_bind_poison=PASS "
                 + "partial_bind_rollback=PASS runtime_child=PASS "
-                + "bound_abort=PASS scheduler_epoch=PASS three_edge_loan=PASS");
+                + "bound_abort=PASS scheduler_epoch=PASS three_edge_loan=PASS "
+                + "owner_scheduler_chain=PASS cleanup_order=PASS");
     }
 
     private static void exactBoundaryLookupFailsClosed() {
@@ -823,6 +940,83 @@ public final class TaskProofIdentityOracle {
         expect(IllegalArgumentException.class,
                 () -> unbound.retireNeverStarted(epoch, exact),
                 "arbitrary child retroactively authenticated scope-only loan");
+    }
+
+    private static void ownerAndSchedulerIdentityMustBothMatch() {
+        Object scope = new Object();
+        Object foreignScope = new Object();
+        Object owner = new Object();
+        Object lookalikeOwner = new Object();
+        Object schedulerChild = new Object();
+        Object foreignSchedulerChild = new Object();
+
+        OwnerSchedulerLoan loan = new OwnerSchedulerLoan();
+        loan.bindScope(scope);
+        loan.bindOwner(scope, owner);
+        expect(IllegalArgumentException.class,
+                () -> loan.bindSchedulerChild(
+                        foreignScope, owner, schedulerChild),
+                "foreign scope bound scheduler child");
+        expect(IllegalArgumentException.class,
+                () -> loan.bindSchedulerChild(
+                        scope, lookalikeOwner, schedulerChild),
+                "lookalike owner bound scheduler child");
+        loan.bindSchedulerChild(scope, owner, schedulerChild);
+
+        expect(IllegalArgumentException.class,
+                () -> loan.retireBeforeScheduler(scope, owner),
+                "owner-only rollback bypassed scheduler binding");
+        expect(IllegalArgumentException.class,
+                () -> loan.retireNeverStarted(
+                        scope, lookalikeOwner, schedulerChild),
+                "lookalike owner retired scheduler-bound loan");
+        expect(IllegalArgumentException.class,
+                () -> loan.retireNeverStarted(
+                        scope, owner, foreignSchedulerChild),
+                "foreign scheduler child retired exact loan");
+        check(loan.retained(),
+                "identity mismatch released exact loan");
+
+        loan.retireNeverStarted(scope, owner, schedulerChild);
+        check(!loan.retained(),
+                "exact owner + scheduler child did not retire loan");
+    }
+
+    private static void cleanupPrecedesExactLoanRetirement() {
+        Object scope = new Object();
+        Object owner = new Object();
+        Object schedulerChild = new Object();
+        StringBuilder order = new StringBuilder();
+
+        OwnerSchedulerLoan success = new OwnerSchedulerLoan();
+        success.bindScope(scope);
+        success.bindOwner(scope, owner);
+        success.bindSchedulerChild(scope, owner, schedulerChild);
+        order.append("physical>");
+        order.append("cleanup>");
+        success.retirePhysical(scope, owner, schedulerChild);
+        order.append("loan>owner>done");
+        check("physical>cleanup>loan>owner>done".contentEquals(order),
+                "physical cleanup/loan/owner ordering changed");
+
+        OwnerSchedulerLoan cleanupFailure = new OwnerSchedulerLoan();
+        cleanupFailure.bindScope(scope);
+        cleanupFailure.bindOwner(scope, owner);
+        cleanupFailure.bindSchedulerChild(scope, owner, schedulerChild);
+        order.setLength(0);
+        order.append("physical>");
+        boolean failed = false;
+        try {
+            order.append("cleanup>");
+            throw new IllegalStateException("cleanup failed");
+        } catch (IllegalStateException expected) {
+            failed = true;
+        }
+        check(failed, "cleanup failure model did not fail");
+        check(cleanupFailure.retained(),
+                "cleanup failure returned exact memory loan");
+        check("physical>cleanup>".contentEquals(order),
+                "loan retirement occurred after failed cleanup");
     }
 
     private static <T extends Throwable> void expect(
