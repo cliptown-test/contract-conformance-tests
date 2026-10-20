@@ -1,0 +1,381 @@
+name: Source-free SCOPED_READ_BORROW oracle
+
+on:
+  push:
+    branches:
+      - 'ci/source-free-scoped-read-*'
+
+permissions: {}
+
+jobs:
+  scoped-read-oracle:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Compile and run independent authority oracle
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat > "$RUNNER_TEMP/ScopedReadBorrowOracle.java" <<'JAVA'
+          import java.util.List;
+          import java.util.Objects;
+          import java.util.Random;
+          import java.util.concurrent.ExecutorService;
+          import java.util.concurrent.Executors;
+          import java.util.concurrent.Future;
+
+          public final class ScopedReadBorrowOracle {
+              enum Mode { READ, WRITE }
+              enum Kind { STATIC_ANALYSIS, SCOPED_READ_BORROW }
+              enum SchedulerState {
+                  PREPARED, BOUND, REGISTERED, ENTERED, NEVER_REGISTERED, QUIESCENT, INDETERMINATE
+              }
+              enum AdmissionState { MINTED, SCOPE_BOUND, OWNER_BOUND, SCHEDULER_BOUND, RETIRED }
+
+              static final class Claim {
+                  final Mode mode;
+                  final boolean sync;
+                  final boolean uniqueAllocation;
+                  final boolean processDomain;
+                  final boolean projectionProven;
+                  final long allocationId;
+                  final long generation;
+
+                  Claim(
+                          Mode mode,
+                          boolean sync,
+                          boolean uniqueAllocation,
+                          boolean processDomain,
+                          boolean projectionProven,
+                          long allocationId,
+                          long generation) {
+                      this.mode = Objects.requireNonNull(mode);
+                      this.sync = sync;
+                      this.uniqueAllocation = uniqueAllocation;
+                      this.processDomain = processDomain;
+                      this.projectionProven = projectionProven;
+                      this.allocationId = allocationId;
+                      this.generation = generation;
+                  }
+              }
+
+              static final class Proof {
+                  final Kind kind;
+                  final List<Claim> claims;
+                  Proof(Kind kind, List<Claim> claims) {
+                      this.kind = Objects.requireNonNull(kind);
+                      this.claims = List.copyOf(claims);
+                  }
+              }
+
+              static final class Ticket {
+                  final Kind kind;
+                  Ticket(Kind kind) {
+                      this.kind = Objects.requireNonNull(kind);
+                  }
+              }
+
+              static final class SchedulerHandle {
+                  private SchedulerState state = SchedulerState.PREPARED;
+
+                  synchronized SchedulerState state() {
+                      return state;
+                  }
+
+                  synchronized void bound() {
+                      require(SchedulerState.PREPARED);
+                      state = SchedulerState.BOUND;
+                  }
+
+                  synchronized void registered() {
+                      require(SchedulerState.BOUND);
+                      state = SchedulerState.REGISTERED;
+                  }
+
+                  synchronized void entered() {
+                      require(SchedulerState.REGISTERED);
+                      state = SchedulerState.ENTERED;
+                  }
+
+                  synchronized void quiescent() {
+                      if (state != SchedulerState.REGISTERED
+                              && state != SchedulerState.ENTERED) {
+                          throw new IllegalStateException("invalid quiescent transition");
+                      }
+                      state = SchedulerState.QUIESCENT;
+                  }
+
+                  private void require(SchedulerState expected) {
+                      if (state != expected) {
+                          throw new IllegalStateException(
+                                  "expected " + expected + " but saw " + state);
+                      }
+                  }
+              }
+
+              static final class Admission {
+                  final Ticket ticket;
+                  private AdmissionState state = AdmissionState.MINTED;
+                  private Object scope;
+                  private Object owner;
+                  private SchedulerHandle scheduler;
+                  private boolean cancelRequested;
+
+                  Admission(Ticket ticket) {
+                      this.ticket = Objects.requireNonNull(ticket);
+                      if (ticket.kind != Kind.SCOPED_READ_BORROW) {
+                          throw new IllegalArgumentException(
+                                  "runtime admission requires SCOPED_READ_BORROW");
+                      }
+                  }
+
+                  synchronized void bindScope(Object exactScope) {
+                      if (state != AdmissionState.MINTED) {
+                          throw new IllegalStateException("scope already bound");
+                      }
+                      scope = Objects.requireNonNull(exactScope);
+                      state = AdmissionState.SCOPE_BOUND;
+                  }
+
+                  synchronized void bindOwner(Object exactScope, Object exactOwner) {
+                      requireScope(exactScope);
+                      if (state != AdmissionState.SCOPE_BOUND) {
+                          throw new IllegalStateException("owner out of order");
+                      }
+                      owner = Objects.requireNonNull(exactOwner);
+                      state = AdmissionState.OWNER_BOUND;
+                  }
+
+                  synchronized void bindScheduler(
+                          Object exactScope,
+                          Object exactOwner,
+                          SchedulerHandle exactScheduler) {
+                      requireScope(exactScope);
+                      if (state != AdmissionState.OWNER_BOUND || owner != exactOwner) {
+                          throw new IllegalArgumentException("wrong owner");
+                      }
+                      scheduler = Objects.requireNonNull(exactScheduler);
+                      state = AdmissionState.SCHEDULER_BOUND;
+                  }
+
+                  synchronized void cancel() {
+                      if (state == AdmissionState.RETIRED) {
+                          throw new IllegalStateException("stale admission");
+                      }
+                      cancelRequested = true;
+                  }
+
+                  synchronized boolean cancelRequested() {
+                      return cancelRequested;
+                  }
+
+                  synchronized boolean parentWriteAllowed() {
+                      return state == AdmissionState.RETIRED;
+                  }
+
+                  synchronized boolean retired() {
+                      return state == AdmissionState.RETIRED;
+                  }
+
+                  synchronized void retirePhysical(
+                          Object exactScope,
+                          Object exactOwner,
+                          SchedulerHandle exactScheduler) {
+                      requireScope(exactScope);
+                      if (state != AdmissionState.SCHEDULER_BOUND
+                              || owner != exactOwner
+                              || scheduler != exactScheduler) {
+                          throw new IllegalArgumentException("identity mismatch");
+                      }
+                      if (exactScheduler.state() != SchedulerState.QUIESCENT) {
+                          throw new IllegalStateException(
+                                  "physical retirement before scheduler quiescence");
+                      }
+                      state = AdmissionState.RETIRED;
+                      owner = null;
+                      scheduler = null;
+                  }
+
+                  private void requireScope(Object exactScope) {
+                      if (scope != exactScope) {
+                          throw new IllegalArgumentException("wrong scope");
+                      }
+                      if (state == AdmissionState.MINTED
+                              || state == AdmissionState.RETIRED) {
+                          throw new IllegalStateException("inactive admission");
+                      }
+                  }
+              }
+
+              static Proof proveScopedRead(List<Claim> claims) {
+                  if (claims.isEmpty()) {
+                      throw new IllegalArgumentException("empty proof");
+                  }
+                  for (Claim claim : claims) {
+                      if (claim.mode != Mode.READ
+                              || !claim.sync
+                              || !claim.uniqueAllocation
+                              || !claim.processDomain
+                              || !claim.projectionProven
+                              || claim.allocationId <= 0
+                              || claim.generation <= 0) {
+                          throw new IllegalArgumentException("invalid scoped read claim");
+                      }
+                  }
+                  return new Proof(Kind.SCOPED_READ_BORROW, claims);
+              }
+
+              static Proof analyze(List<Claim> claims) {
+                  if (claims.isEmpty()) {
+                      throw new IllegalArgumentException("empty analysis");
+                  }
+                  return new Proof(Kind.STATIC_ANALYSIS, claims);
+              }
+
+              static Ticket ticket(Proof proof) {
+                  return new Ticket(proof.kind);
+              }
+
+              static Admission runtimeAdmission(Proof proof) {
+                  return new Admission(ticket(proof));
+              }
+
+              static Claim claim(
+                      Mode mode,
+                      boolean sync,
+                      boolean unique,
+                      boolean process,
+                      boolean projection,
+                      long allocation,
+                      long generation) {
+                  return new Claim(
+                          mode, sync, unique, process, projection,
+                          allocation, generation);
+              }
+
+              static void expect(boolean condition, String message) {
+                  if (!condition) {
+                      throw new AssertionError(message);
+                  }
+              }
+
+              static void expectIllegal(Runnable action, String message) {
+                  try {
+                      action.run();
+                  } catch (IllegalArgumentException | IllegalStateException expected) {
+                      return;
+                  }
+                  throw new AssertionError(message);
+              }
+
+              public static void main(String[] args) throws Exception {
+                  Claim valid = claim(
+                          Mode.READ, true, true, true, true, 91L, 7L);
+                  Proof readProof = proveScopedRead(List.of(valid));
+                  expect(readProof.kind == Kind.SCOPED_READ_BORROW,
+                          "read proof kind");
+
+                  Claim write = claim(
+                          Mode.WRITE, true, true, true, true, 91L, 7L);
+                  Proof staticWrite = analyze(List.of(write));
+                  expectIllegal(
+                          () -> runtimeAdmission(staticWrite),
+                          "static WRITE proof reached runtime admission");
+                  expectIllegal(
+                          () -> proveScopedRead(List.of(write)),
+                          "WRITE minted SCOPED_READ_BORROW");
+
+                  Random random = new Random(0x5C0F3D1234L);
+                  int proofRounds = 50_000;
+                  for (int i = 0; i < proofRounds; i++) {
+                      Mode mode = random.nextBoolean() ? Mode.READ : Mode.WRITE;
+                      boolean sync = random.nextBoolean();
+                      boolean unique = random.nextBoolean();
+                      boolean process = random.nextBoolean();
+                      boolean projection = random.nextBoolean();
+                      long allocation = random.nextBoolean() ? i + 1L : 0L;
+                      long generation = random.nextBoolean() ? (i % 31L) + 1L : 0L;
+                      Claim candidate = claim(
+                              mode, sync, unique, process, projection,
+                              allocation, generation);
+                      boolean shouldPass = mode == Mode.READ
+                              && sync && unique && process && projection
+                              && allocation > 0L && generation > 0L;
+                      boolean passed;
+                      try {
+                          proveScopedRead(List.of(candidate));
+                          passed = true;
+                      } catch (IllegalArgumentException rejected) {
+                          passed = false;
+                      }
+                      expect(passed == shouldPass,
+                              "proof matrix mismatch at round " + i);
+                  }
+
+                  int raceRounds = 20_000;
+                  ExecutorService pool = Executors.newFixedThreadPool(4);
+                  try {
+                      for (int i = 0; i < raceRounds; i++) {
+                          Admission admission = runtimeAdmission(readProof);
+                          Object scope = new Object();
+                          Object owner = new Object();
+                          SchedulerHandle scheduler = new SchedulerHandle();
+                          admission.bindScope(scope);
+                          admission.bindOwner(scope, owner);
+                          admission.bindScheduler(scope, owner, scheduler);
+                          scheduler.bound();
+                          scheduler.registered();
+                          scheduler.entered();
+
+                          Future<?> cancel = pool.submit(admission::cancel);
+                          Future<?> earlyRetire = pool.submit(() -> {
+                              expectIllegal(
+                                      () -> admission.retirePhysical(
+                                              scope, owner, scheduler),
+                                      "early physical retirement succeeded");
+                          });
+                          cancel.get();
+                          earlyRetire.get();
+
+                          expect(admission.cancelRequested(),
+                                  "cancellation intent lost");
+                          expect(!admission.retired(),
+                                  "cancel or early retirement released authority");
+                          expect(!admission.parentWriteAllowed(),
+                                  "parent WRITE returned before quiescence");
+
+                          SchedulerHandle lookalike = new SchedulerHandle();
+                          lookalike.bound();
+                          lookalike.registered();
+                          lookalike.entered();
+                          lookalike.quiescent();
+                          expectIllegal(
+                                  () -> admission.retirePhysical(
+                                          scope, owner, lookalike),
+                                  "lookalike scheduler forged retirement");
+
+                          scheduler.quiescent();
+                          admission.retirePhysical(scope, owner, scheduler);
+                          expect(admission.retired(),
+                                  "physical quiescence did not retire");
+                          expect(admission.parentWriteAllowed(),
+                                  "parent WRITE did not return after retirement");
+                      }
+                  } finally {
+                      pool.shutdownNow();
+                  }
+
+                  System.out.println("SCOPED_READ_BORROW_PROOF_MATRIX_PASS=" + proofRounds);
+                  System.out.println("SCOPED_READ_BORROW_RACE_PASS=" + raceRounds);
+                  System.out.println("WRITE_RUNTIME_DISABLED=PASS");
+                  System.out.println("SYNC_REQUIRED=PASS");
+                  System.out.println("EXACT_ALLOCATION_GENERATION_PROJECTION=PASS");
+                  System.out.println("EXACT_SCHEDULER_IDENTITY=PASS");
+                  System.out.println("CANCEL_RETAINS_AUTHORITY_TO_QUIESCENCE=PASS");
+              }
+          }
+          JAVA
+
+          java -version
+          javac --release 17 -Xlint:all -Werror "$RUNNER_TEMP/ScopedReadBorrowOracle.java"
+          java -ea -cp "$RUNNER_TEMP" ScopedReadBorrowOracle
