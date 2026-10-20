@@ -199,15 +199,48 @@ public final class TaskProofIdentityOracle {
         }
     }
 
+    private static final class FailedAuthorityScope {
+        private final IdentityHashMap<Object, Throwable> failed =
+                new IdentityHashMap<>();
+
+        void failBeforeDispatch(
+                Object loanAuthority,
+                Runnable retireLoan,
+                Object resourceAuthority,
+                Runnable releaseResource) {
+            try {
+                retireLoan.run();
+            } catch (RuntimeException | Error failure) {
+                failed.put(loanAuthority, failure);
+                return;
+            }
+            try {
+                releaseResource.run();
+            } catch (RuntimeException | Error failure) {
+                failed.put(resourceAuthority, failure);
+            }
+        }
+
+        boolean retains(Object exactAuthority) {
+            return failed.containsKey(exactAuthority);
+        }
+
+        boolean physicallyQuiescent() {
+            return failed.isEmpty();
+        }
+    }
+
     public static void main(String[] args) {
         exactBoundaryLookupFailsClosed();
         scopeEpochRejectsForeignAndStaleTickets();
         reservationBindsExactScopeChildAndLifecycle();
         staleGenerationFailsBeforeRetirementHook();
         retirementFailureCannotPublishDrainWitness();
+        preDispatchRetirementFailureRetainsExactAuthority();
         System.out.println(
                 "TASK_PROOF_IDENTITY_ORACLE=PASS exact_boundary=PASS scope_epoch=PASS "
-                + "reservation=PASS exact_child=PASS generation=PASS poison=PASS");
+                + "reservation=PASS exact_child=PASS generation=PASS poison=PASS "
+                + "pre_dispatch_poison=PASS");
     }
 
     private static void exactBoundaryLookupFailsClosed() {
@@ -373,6 +406,47 @@ public final class TaskProofIdentityOracle {
                 "poisoned memory authority must never publish scope drain");
         check(!scope.drainDone,
                 "poisoned scope manufactured reclamation witness");
+    }
+
+    private static void preDispatchRetirementFailureRetainsExactAuthority() {
+        Object loan = new Object();
+        Object resource = new Object();
+        RuntimeException loanFailure =
+                new RuntimeException("never-started loan retirement failed");
+        boolean[] resourceReleased = {false};
+        FailedAuthorityScope failedLoan = new FailedAuthorityScope();
+
+        failedLoan.failBeforeDispatch(
+                loan,
+                () -> { throw loanFailure; },
+                resource,
+                () -> resourceReleased[0] = true);
+
+        check(failedLoan.retains(loan),
+                "failed never-started loan authority was not retained by identity");
+        check(!failedLoan.retains(new Object()),
+                "lookalike authority matched identity poison");
+        check(!resourceReleased[0],
+                "dependent resource release ran after loan retirement failed");
+        check(!failedLoan.physicallyQuiescent(),
+                "failed never-started loan manufactured physical quiescence");
+
+        Object loan2 = new Object();
+        Object resource2 = new Object();
+        RuntimeException resourceFailure =
+                new RuntimeException("resource release failed");
+        FailedAuthorityScope failedResource = new FailedAuthorityScope();
+
+        failedResource.failBeforeDispatch(
+                loan2,
+                () -> { },
+                resource2,
+                () -> { throw resourceFailure; });
+
+        check(failedResource.retains(resource2),
+                "failed physical-resource authority was not retained by identity");
+        check(!failedResource.physicallyQuiescent(),
+                "failed resource release manufactured physical quiescence");
     }
 
     private static <T extends Throwable> void expect(
