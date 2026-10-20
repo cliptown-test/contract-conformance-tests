@@ -208,21 +208,28 @@ public final class TaskProofIdentityOracle {
                 Runnable retireLoan,
                 Object resourceAuthority,
                 Runnable releaseResource) {
-            try {
-                retireLoan.run();
-            } catch (RuntimeException | Error failure) {
-                failed.put(loanAuthority, failure);
-                return;
-            }
+            // Resource/code/FFI cleanup may still rely on borrowed memory.
+            // It must retire before the memory-loan capability is returned.
             try {
                 releaseResource.run();
             } catch (RuntimeException | Error failure) {
                 failed.put(resourceAuthority, failure);
+                failed.put(loanAuthority, failure);
+                return;
+            }
+            try {
+                retireLoan.run();
+            } catch (RuntimeException | Error failure) {
+                failed.put(loanAuthority, failure);
             }
         }
 
         boolean retains(Object exactAuthority) {
             return failed.containsKey(exactAuthority);
+        }
+
+        int retainedAuthorities() {
+            return failed.size();
         }
 
         boolean physicallyQuiescent() {
@@ -427,8 +434,8 @@ public final class TaskProofIdentityOracle {
                 "failed never-started loan authority was not retained by identity");
         check(!failedLoan.retains(new Object()),
                 "lookalike authority matched identity poison");
-        check(!resourceReleased[0],
-                "dependent resource release ran after loan retirement failed");
+        check(resourceReleased[0],
+                "resource cleanup must run before memory-loan retirement");
         check(!failedLoan.physicallyQuiescent(),
                 "failed never-started loan manufactured physical quiescence");
 
@@ -446,6 +453,10 @@ public final class TaskProofIdentityOracle {
 
         check(failedResource.retains(resource2),
                 "failed physical-resource authority was not retained by identity");
+        check(failedResource.retains(loan2),
+                "resource failure lost the exact still-live loan authority");
+        check(failedResource.retainedAuthorities() == 2,
+                "resource failure must retain resource + loan authorities");
         check(!failedResource.physicallyQuiescent(),
                 "failed resource release manufactured physical quiescence");
     }
