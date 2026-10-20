@@ -137,7 +137,7 @@ public final class TaskScopeQuiescenceOracle {
                 sealed = true;
                 done = children.isEmpty();
             }
-            if (done) drained.countDown();
+            if (done) completeDrain();
         }
 
         void cancelAndQuiesce() {
@@ -168,7 +168,7 @@ public final class TaskScopeQuiescenceOracle {
                 child.quiescent = true;
                 done = retireIfReady(child);
             }
-            if (done) drained.countDown();
+            if (done) completeDrain();
         }
 
         private void markTerminal(Child child) {
@@ -177,7 +177,7 @@ public final class TaskScopeQuiescenceOracle {
                 child.terminal = true;
                 done = retireIfReady(child);
             }
-            if (done) drained.countDown();
+            if (done) completeDrain();
         }
 
         private boolean retireIfReady(Child child) {
