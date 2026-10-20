@@ -107,13 +107,16 @@ public final class ExecutionPermitOracle {
             for (int i = 0; i < copy.size(); i++) {
                 Access part = Objects.requireNonNull(copy.get(i));
                 for (int j = 0; j < i; j++) {
-                    if (part.overlaps(copy.get(j))) {
+                    Access prior = copy.get(j);
+                    if (part.overlaps(prior) || prior.overlaps(part)) {
                         throw new IllegalArgumentException("overlap");
                     }
                 }
                 covered = covered == null ? part : covered.union(part);
             }
-            if (!covered.same(access)) throw new IllegalArgumentException("coverage");
+            if (!covered.same(access) || !access.same(covered)) {
+                throw new IllegalArgumentException("coverage");
+            }
 
             synchronized (root) {
                 requireLive();
@@ -168,14 +171,17 @@ public final class ExecutionPermitOracle {
             }
         }
 
-        Permit rotate(long next) {
+        Permit rotate(long next, Access nextAccess) {
+            if (!access.same(nextAccess) || !nextAccess.same(access)) {
+                throw new IllegalArgumentException("authority");
+            }
             synchronized (root) {
                 requireLive();
                 if (parent != null) throw new IllegalStateException("not root");
                 if (next <= generation) throw new IllegalArgumentException("generation");
                 live.set(false);
                 root.generation = next;
-                return new Permit(root, next, access, null, -1);
+                return new Permit(root, next, nextAccess, null, -1);
             }
         }
 
@@ -190,7 +196,7 @@ public final class ExecutionPermitOracle {
         nestedLineage();
         concurrentRejoinVsResplit();
         System.out.println(
-                "EXECUTION_PERMIT_ORACLE=PASS arbitration_rounds=20000 nested=PASS generation=PASS");
+                "EXECUTION_PERMIT_ORACLE=PASS arbitration_rounds=20000 nested=PASS generation=PASS authority=PASS");
     }
 
     private static void deterministicContracts() {
@@ -206,7 +212,9 @@ public final class ExecutionPermitOracle {
         check(children.get(1).isLive(), "failed rejoin consumed child 1");
 
         Permit restored = Permit.rejoin(children);
-        Permit next = restored.rotate(5);
+        expectFailure(() -> restored.rotate(5, Access.of(1, 2, 3, 4, 5)));
+        check(restored.isLive(), "rejected authority widening consumed root");
+        Permit next = restored.rotate(5, Access.of(1, 2, 3, 4));
         check(!restored.isLive(), "rotated permit remained live");
         check(next.isLive(), "next generation is not live");
         expectFailure(() -> restored.split(List.of(Access.of(1, 2), Access.of(3, 4))));
