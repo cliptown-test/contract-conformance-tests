@@ -142,7 +142,9 @@ public final class TaskScopeQuiescenceOracle {
                 if (claim != null) claims.add(claim);
             }
             for (SplitFuture.Claim claim : claims) claim.revoke();
-            for (SplitFuture.Claim claim : claims) claim.publish();
+            for (SplitFuture.Claim claim : claims) {
+                Thread.ofVirtual().start(claim::publish);
+            }
 
             synchronized (lock) {
                 if (children.isEmpty()) drained.countDown();
@@ -188,13 +190,13 @@ public final class TaskScopeQuiescenceOracle {
         physicalQuiescenceRemainsRequired();
         nestedCancellationIsTransitive();
         raceStress();
-        System.out.println("TASK_SCOPE_ORACLE=PASS races=50000 blocked_subscribers=3 nested=PASS");
+        System.out.println("TASK_SCOPE_ORACLE=PASS races=50000 blocked_subscribers=3 independent_publish=PASS nested=PASS");
     }
 
     private static void twoPhaseRevokesAllBeforeBlockingSubscribers() throws Exception {
         Scope scope = new Scope();
         List<Child> children = List.of(scope.addChild(), scope.addChild(), scope.addChild());
-        CountDownLatch subscriberEntered = new CountDownLatch(1);
+        CountDownLatch subscriberEntered = new CountDownLatch(3);
         CountDownLatch releaseSubscribers = new CountDownLatch(1);
 
         for (Child child : children) {
@@ -205,16 +207,18 @@ public final class TaskScopeQuiescenceOracle {
         }
 
         Thread canceller = Thread.ofPlatform().start(scope::cancelAndQuiesce);
-        check(subscriberEntered.await(5, TimeUnit.SECONDS), "subscriber did not block");
+        check(subscriberEntered.await(5, TimeUnit.SECONDS),
+                "all child subscriber paths must begin independently");
 
         for (Child child : children) {
             check(child.future.isCancelled(), "not every cancellation claim won first");
             check(child.future.isRevoked(), "not every revocation completed first");
         }
 
-        releaseSubscribers.countDown();
         canceller.join(5000);
-        check(!canceller.isAlive(), "cancellation publisher stuck");
+        check(!canceller.isAlive(),
+                "scope cancellation caller was pinned behind ordinary subscribers");
+        releaseSubscribers.countDown();
     }
 
     private static void terminalReadyBeatsBlockingSubscriber() throws Exception {
