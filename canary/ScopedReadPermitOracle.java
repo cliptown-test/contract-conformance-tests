@@ -229,6 +229,7 @@ public final class ScopedReadPermitOracle {
             final LeaseClaim claim;
             boolean terminal;
             boolean quiescent;
+            boolean retirementClaimed;
             boolean retired;
 
             LeaseChild(LeaseClaim claim) {
@@ -243,6 +244,7 @@ public final class ScopedReadPermitOracle {
         private final Map<Long, RegionLease> regions = new HashMap<>();
         private final Set<LeaseChild> liveChildren =
                 Collections.newSetFromMap(new IdentityHashMap<>());
+        private boolean poisoned;
 
         synchronized LeaseChild fork(LeaseClaim claim) {
             Proof proof = claim.proof;
@@ -298,20 +300,50 @@ public final class ScopedReadPermitOracle {
             }
         }
 
+        synchronized void corruptRegionForTest(long regionId) {
+            regions.remove(regionId);
+        }
+
+        synchronized boolean isPoisoned() {
+            return poisoned;
+        }
+
+        synchronized int liveChildren() {
+            return liveChildren.size();
+        }
+
+        synchronized boolean canPublishDrainWitness() {
+            return !poisoned && liveChildren.isEmpty();
+        }
+
         private void retireIfReady(LeaseChild child) {
-            if (child.retired || !child.terminal || !child.quiescent) return;
+            if (child.retired
+                    || child.retirementClaimed
+                    || !child.terminal
+                    || !child.quiescent) {
+                return;
+            }
+            child.retirementClaimed = true;
+
             RegionLease lease = regions.get(child.proof().regionId());
             if (lease == null
                     || lease.generation != child.proof().generation()
                     || lease.readers <= 0) {
-                throw new AssertionError("lease accounting corrupted");
+                // Failed memory-authority retirement pins the child and
+                // permanently forbids a drain witness.
+                poisoned = true;
+                return;
             }
+
+            // Retire region authority before the child can leave the join set.
+            lease.readers--;
+            if (lease.readers == 0) regions.remove(child.proof().regionId());
+
             if (!liveChildren.remove(child)) {
-                throw new AssertionError("lease child identity retired twice");
+                poisoned = true;
+                return;
             }
             child.retired = true;
-            lease.readers--;
-            if (lease.readers == 0) regions.remove(child.proof.regionId());
         }
     }
 
@@ -328,6 +360,7 @@ public final class ScopedReadPermitOracle {
         runtimeLeaseSurvivesLogicalCancellationUntilPhysicalQuiescence();
         concurrentReadersShareGenerationAndRejectMismatchAtomically();
         oneClaimCannotRaceAcrossTwoScopes();
+        retirementCorruptionPoisonsJoinWitness();
         ownedProofCarriesNoAuthority();
 
         System.out.println(
@@ -336,7 +369,7 @@ public final class ScopedReadPermitOracle {
                 + "reborrow=PASS deferred=PASS mutation=PASS generation=PASS stale=PASS "
                 + "lifetime=PASS live_generation=PASS readers=PASS "
                 + "claim_identity=PASS aba=PASS cross_scope=PASS "
-                + "resume_guard=PASS");
+                + "poison=PASS resume_guard=PASS");
     }
 
     private static void directReadSurvivesSuspension() {
@@ -566,6 +599,32 @@ public final class ScopedReadPermitOracle {
             Thread.currentThread().interrupt();
             throw new AssertionError(interrupted);
         }
+    }
+
+    private static void retirementCorruptionPoisonsJoinWitness() {
+        Proof proof = new Proof(
+                "view", Mode.SCOPED_READ_BORROW, 113L, 6L, "$");
+        LeaseScope.LeaseClaim claim = new LeaseScope.LeaseClaim(proof);
+        LeaseScope scope = new LeaseScope();
+        LeaseScope.LeaseChild child = scope.fork(claim);
+
+        scope.terminal(child);
+        check(scope.liveChildren() == 1,
+                "terminal-only child left join set");
+
+        // Simulate trusted runtime accounting corruption immediately before
+        // physical-quiescence retirement.
+        scope.corruptRegionForTest(113L);
+        scope.quiescent(child);
+
+        check(scope.isPoisoned(),
+                "retirement corruption did not poison scope");
+        check(scope.liveChildren() == 1,
+                "failed retirement removed child from join set");
+        check(!scope.canPublishDrainWitness(),
+                "poisoned memory authority manufactured a drain witness");
+        check(claim.issued.get(),
+                "failed physical retirement resurrected one-shot claim");
     }
 
     private static void ownedProofCarriesNoAuthority() {
