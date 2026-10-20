@@ -676,7 +676,6 @@ public final class ScopedReadPermitOracle {
                         "sibling", Mode.SCOPED_READ_BORROW, 128L, 0L, "$")));
 
         scope.terminal(corrupt);
-        scope.terminal(sibling);
         scope.corruptRegionForTest(127L);
         scope.quiescent(corrupt);
 
