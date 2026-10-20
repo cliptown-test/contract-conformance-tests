@@ -784,7 +784,8 @@ public final class ScopedReadPermitOracle {
 
 
     private static void fatalCleanupOutranksScopePoison() {
-        ScopePoison poison = new ScopePoison("authority accounting poisoned");
+        ScopePoison poison = new ScopePoison(
+                new IllegalStateException("authority accounting poisoned"));
         FatalHostError fatal = new FatalHostError("vm fatal");
         Throwable winner = mergeCleanupFailure(poison, fatal);
         check(winner == fatal, "host-fatal cleanup was masked by scope poison");
@@ -793,7 +794,8 @@ public final class ScopedReadPermitOracle {
                 "scope poison was not retained as suppressed diagnostic");
 
         FatalHostError earlierFatal = new FatalHostError("earlier vm fatal");
-        ScopePoison laterPoison = new ScopePoison("later poison");
+        ScopePoison laterPoison = new ScopePoison(
+                new IllegalStateException("later poison"));
         Throwable earlierWinner = mergeCleanupFailure(earlierFatal, laterPoison);
         check(earlierWinner == earlierFatal,
                 "later scope poison replaced an earlier host-fatal failure");
