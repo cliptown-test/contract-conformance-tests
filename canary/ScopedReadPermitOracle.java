@@ -19,6 +19,12 @@ public final class ScopedReadPermitOracle {
 
     private enum Mode { OWNED_SEND, SCOPED_READ_BORROW }
 
+    private static final class ScopePoison extends RuntimeException {
+        ScopePoison(Throwable cause) {
+            super("structured scope authority accounting poisoned", cause);
+        }
+    }
+
     private record Proof(
             String name,
             Mode mode,
@@ -400,6 +406,7 @@ public final class ScopedReadPermitOracle {
         oneClaimCannotRaceAcrossTwoScopes();
         retirementCorruptionPoisonsJoinWitness();
         poisonWaitsForSiblingPhysicalQuiescence();
+        poisonIsNotGuestRecoverable();
         ownedProofCarriesNoAuthority();
 
         System.out.println(
@@ -408,7 +415,8 @@ public final class ScopedReadPermitOracle {
                 + "reborrow=PASS deferred=PASS mutation=PASS generation=PASS stale=PASS "
                 + "lifetime=PASS live_generation=PASS readers=PASS "
                 + "claim_identity=PASS aba=PASS cross_scope=PASS "
-                + "poison=PASS poison_barrier=PASS resume_guard=PASS");
+                + "poison=PASS poison_barrier=PASS poison_unmaskable=PASS "
+                + "resume_guard=PASS");
     }
 
     private static void directReadSurvivesSuspension() {
@@ -690,6 +698,41 @@ public final class ScopedReadPermitOracle {
                 "poison failure did not publish after every carrier quiesced");
         check(!scope.canPublishDrainWitness(),
                 "poisoned scope manufactured a success witness");
+    }
+
+    private static void poisonIsNotGuestRecoverable() {
+        ScopePoison poison = new ScopePoison(
+                new IllegalStateException("region accounting corrupt"));
+        check(!guestRecoverable(poison),
+                "direct poison became guest recoverable");
+
+        RuntimeException wrapped = new IllegalStateException(
+                "future failed", poison);
+        check(!guestRecoverable(wrapped),
+                "wrapped poison became guest recoverable");
+
+        RuntimeException suppressed = new IllegalStateException("cleanup");
+        suppressed.addSuppressed(poison);
+        check(!guestRecoverable(suppressed),
+                "suppressed poison became guest recoverable");
+    }
+
+    private static boolean guestRecoverable(Throwable failure) {
+        java.util.ArrayDeque<Throwable> pending = new java.util.ArrayDeque<>();
+        java.util.IdentityHashMap<Throwable, Boolean> seen =
+                new java.util.IdentityHashMap<>();
+        pending.add(failure);
+        while (!pending.isEmpty()) {
+            Throwable current = pending.removeFirst();
+            if (seen.put(current, Boolean.TRUE) != null) return false;
+            if (current instanceof ScopePoison) return false;
+            if (current.getCause() != null) pending.addLast(current.getCause());
+            for (Throwable suppressed : current.getSuppressed()) {
+                pending.addLast(suppressed);
+            }
+            if (seen.size() + pending.size() > 64) return false;
+        }
+        return true;
     }
 
     private static void ownedProofCarriesNoAuthority() {
