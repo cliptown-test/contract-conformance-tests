@@ -68,10 +68,14 @@ jobs:
           javac --release 21 -Xlint:all -Werror \
             -d build/task-scope-oracle \
             canary/TaskScopeQuiescenceOracle.java \
-            canary/ExecutionPermitOracle.java
+            canary/ExecutionPermitOracle.java \
+            canary/TaskProofIdentityOracle.java
 
       - name: Run source-free structured-task oracle
         run: java -ea -cp build/task-scope-oracle canary.TaskScopeQuiescenceOracle
 
       - name: Run source-free execution-permit oracle
         run: java -ea -cp build/task-scope-oracle canary.ExecutionPermitOracle
+
+      - name: Run source-free proof-identity oracle
+        run: java -ea -cp build/task-scope-oracle canary.TaskProofIdentityOracle
