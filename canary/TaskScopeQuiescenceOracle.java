@@ -18,6 +18,14 @@ import java.util.concurrent.atomic.AtomicReference;
 public final class TaskScopeQuiescenceOracle {
     private TaskScopeQuiescenceOracle() { }
 
+    private static final class ScopePoison extends RuntimeException {
+        private static final long serialVersionUID = 1L;
+
+        ScopePoison(Throwable cause) {
+            super("structured scope owner finalization poisoned", cause);
+        }
+    }
+
     private enum State { PENDING, CANCELLED, SUCCESS }
 
     private static final class SplitFuture {
@@ -203,7 +211,7 @@ public final class TaskScopeQuiescenceOracle {
             try {
                 onClosed.run();
             } catch (RuntimeException | Error failure) {
-                drainFailure.set(failure);
+                drainFailure.set(new ScopePoison(failure));
             } finally {
                 drained.countDown();
             }
@@ -221,7 +229,7 @@ public final class TaskScopeQuiescenceOracle {
         nestedCancellationIsTransitive();
         ownerFinalizationFailurePoisonsDrain();
         raceStress();
-        System.out.println("TASK_SCOPE_ORACLE=PASS races=50000 blocked_subscribers=3 independent_publish=PASS nested=PASS owner_failure=PASS");
+        System.out.println("TASK_SCOPE_ORACLE=PASS races=50000 blocked_subscribers=3 independent_publish=PASS nested=PASS owner_failure=PASS owner_poison=PASS");
     }
 
     private static void twoPhaseRevokesAllBeforeBlockingSubscribers() throws Exception {
@@ -324,8 +332,10 @@ public final class TaskScopeQuiescenceOracle {
                 "failed owner finalization did not settle drain barrier");
         check(!scope.drainSucceeded(),
                 "owner finalization failure incorrectly reported successful drain");
-        check(scope.drainFailure() == expected,
-                "drain barrier lost owner finalization failure identity");
+        check(scope.drainFailure() instanceof ScopePoison,
+                "owner finalization failure was not promoted to scope poison");
+        check(scope.drainFailure().getCause() == expected,
+                "scope poison lost owner finalization failure identity");
     }
 
     private static void raceStress() throws Exception {
