@@ -102,7 +102,18 @@ public final class TaskScopeQuiescenceOracle {
         private final Object lock = new Object();
         private final List<Child> children = new ArrayList<>();
         private final CountDownLatch drained = new CountDownLatch(1);
+        private final AtomicBoolean drainSettled = new AtomicBoolean();
+        private final AtomicReference<Throwable> drainFailure = new AtomicReference<>();
+        private final Runnable onClosed;
         private boolean sealed;
+
+        Scope() {
+            this(() -> { });
+        }
+
+        Scope(Runnable onClosed) {
+            this.onClosed = Objects.requireNonNull(onClosed);
+        }
 
         Child addChild() {
             return addChild(() -> { });
@@ -147,7 +158,7 @@ public final class TaskScopeQuiescenceOracle {
             }
 
             synchronized (lock) {
-                if (children.isEmpty()) drained.countDown();
+                if (children.isEmpty()) completeDrain();
             }
         }
 
@@ -179,6 +190,25 @@ public final class TaskScopeQuiescenceOracle {
             return drained.await(timeout, unit);
         }
 
+        boolean drainSucceeded() {
+            return drainSettled.get() && drainFailure.get() == null;
+        }
+
+        Throwable drainFailure() {
+            return drainFailure.get();
+        }
+
+        private void completeDrain() {
+            if (!drainSettled.compareAndSet(false, true)) return;
+            try {
+                onClosed.run();
+            } catch (RuntimeException | Error failure) {
+                drainFailure.set(failure);
+            } finally {
+                drained.countDown();
+            }
+        }
+
         int activeChildren() {
             synchronized (lock) { return children.size(); }
         }
@@ -189,8 +219,9 @@ public final class TaskScopeQuiescenceOracle {
         terminalReadyBeatsBlockingSubscriber();
         physicalQuiescenceRemainsRequired();
         nestedCancellationIsTransitive();
+        ownerFinalizationFailurePoisonsDrain();
         raceStress();
-        System.out.println("TASK_SCOPE_ORACLE=PASS races=50000 blocked_subscribers=3 independent_publish=PASS nested=PASS");
+        System.out.println("TASK_SCOPE_ORACLE=PASS races=50000 blocked_subscribers=3 independent_publish=PASS nested=PASS owner_failure=PASS");
     }
 
     private static void twoPhaseRevokesAllBeforeBlockingSubscribers() throws Exception {
@@ -280,6 +311,21 @@ public final class TaskScopeQuiescenceOracle {
         check(inner.awaitDrain(5, TimeUnit.SECONDS), "inner scope failed to drain");
         outer.markQuiescent(child);
         check(outer.awaitDrain(5, TimeUnit.SECONDS), "outer scope failed to drain after inner scope");
+    }
+
+
+    private static void ownerFinalizationFailurePoisonsDrain() throws Exception {
+        RuntimeException expected = new RuntimeException("owner finalization failed");
+        Scope scope = new Scope(() -> { throw expected; });
+
+        scope.quiesce();
+
+        check(scope.awaitDrain(5, TimeUnit.SECONDS),
+                "failed owner finalization did not settle drain barrier");
+        check(!scope.drainSucceeded(),
+                "owner finalization failure incorrectly reported successful drain");
+        check(scope.drainFailure() == expected,
+                "drain barrier lost owner finalization failure identity");
     }
 
     private static void raceStress() throws Exception {
