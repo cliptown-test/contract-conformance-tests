@@ -237,10 +237,11 @@ public final class TaskProofIdentityOracle {
         staleGenerationFailsBeforeRetirementHook();
         retirementFailureCannotPublishDrainWitness();
         preDispatchRetirementFailureRetainsExactAuthority();
+        partialScopeBindingFailureRetainsExactAuthority();
         System.out.println(
                 "TASK_PROOF_IDENTITY_ORACLE=PASS exact_boundary=PASS scope_epoch=PASS "
                 + "reservation=PASS exact_child=PASS generation=PASS poison=PASS "
-                + "pre_dispatch_poison=PASS");
+                + "pre_dispatch_poison=PASS partial_bind_poison=PASS");
     }
 
     private static void exactBoundaryLookupFailsClosed() {
@@ -447,6 +448,40 @@ public final class TaskProofIdentityOracle {
                 "failed physical-resource authority was not retained by identity");
         check(!failedResource.physicallyQuiescent(),
                 "failed resource release manufactured physical quiescence");
+    }
+
+    private static void partialScopeBindingFailureRetainsExactAuthority() {
+        Object exactLoan = new Object();
+        Object acceptedEpoch = new Object();
+        Object[] boundEpoch = {null};
+        FailedAuthorityScope scope = new FailedAuthorityScope();
+        RuntimeException failure =
+                new RuntimeException("scope binding failed after accepting epoch");
+
+        Runnable partialBind = () -> {
+            boundEpoch[0] = acceptedEpoch;
+            throw failure;
+        };
+
+        RuntimeException observed = expectAndReturn(
+                RuntimeException.class,
+                partialBind,
+                "partial scope binding must fail");
+        check(observed == failure, "partial binding failure identity changed");
+        check(boundEpoch[0] == acceptedEpoch,
+                "oracle did not model partial epoch acceptance");
+
+        // Once a trusted lifecycle object has partially accepted an epoch,
+        // exact identity must be retained even though no runtime child exists.
+        scope.failBeforeDispatch(
+                exactLoan,
+                () -> { throw failure; },
+                new Object(),
+                () -> { });
+        check(scope.retains(exactLoan),
+                "partially bound exact loan was not retained");
+        check(!scope.physicallyQuiescent(),
+                "partial scope binding manufactured physical quiescence");
     }
 
     private static <T extends Throwable> void expect(
