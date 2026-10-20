@@ -259,6 +259,13 @@ public final class ScopedReadPermitOracle {
             return lease == null ? 0 : lease.readers;
         }
 
+        synchronized void requireLiveForResume(LeaseChild child) {
+            if (!hasLease(child.proof.regionId(), child.proof.generation())) {
+                throw new IllegalStateException(
+                        "scoped read continuation resumed without a live lease");
+            }
+        }
+
         private void retireIfReady(LeaseChild child) {
             if (child.retired || !child.terminal || !child.quiescent) return;
             RegionLease lease = regions.get(child.proof.regionId());
@@ -291,7 +298,7 @@ public final class ScopedReadPermitOracle {
                 "SCOPED_READ_PERMIT_ORACLE=PASS "
                 + "suspension=PASS exact_binding=PASS nested_ticket=PASS "
                 + "reborrow=PASS deferred=PASS mutation=PASS generation=PASS stale=PASS "
-                + "lifetime=PASS live_generation=PASS readers=PASS");
+                + "lifetime=PASS live_generation=PASS readers=PASS resume_guard=PASS");
     }
 
     private static void directReadSurvivesSuspension() {
@@ -424,10 +431,12 @@ public final class ScopedReadPermitOracle {
         check(scope.hasLease(77L, 4L),
                 "logical terminal state retired authority before physical quiescence");
         check(scope.readers(77L) == 1, "reader count changed before quiescence");
+        scope.requireLiveForResume(child);
 
         scope.quiescent(child);
         check(!scope.hasLease(77L, 4L),
                 "lease remained live after terminal + physical quiescence");
+        expectFailure(() -> scope.requireLiveForResume(child));
         check(scope.readers(77L) == 0, "reader count leaked after retirement");
     }
 
