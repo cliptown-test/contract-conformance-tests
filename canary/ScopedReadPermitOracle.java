@@ -20,6 +20,8 @@ public final class ScopedReadPermitOracle {
     private enum Mode { OWNED_SEND, SCOPED_READ_BORROW }
 
     private static final class ScopePoison extends RuntimeException {
+        private static final long serialVersionUID = 1L;
+
         ScopePoison(Throwable cause) {
             super("structured scope authority accounting poisoned", cause);
         }
