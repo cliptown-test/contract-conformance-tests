@@ -355,6 +355,7 @@ public final class TaskProofIdentityOracle {
         retirementFailureCannotPublishDrainWitness();
         preDispatchRetirementFailureRetainsExactAuthority();
         partialScopeBindingFailureRetainsExactAuthority();
+        partialBindRollbackUsesExactNeverStartedChild();
         exactRuntimeChildRetirementIsIdentityBound();
         boundLeaseCannotBeAbortedByOuterFailure();
         crossSchedulerChildCannotRetireAuthority();
@@ -362,7 +363,8 @@ public final class TaskProofIdentityOracle {
                 "TASK_PROOF_IDENTITY_ORACLE=PASS exact_boundary=PASS scope_epoch=PASS "
                 + "reservation=PASS exact_child=PASS generation=PASS poison=PASS "
                 + "pre_dispatch_poison=PASS partial_bind_poison=PASS "
-                + "runtime_child=PASS bound_abort=PASS scheduler_epoch=PASS");
+                + "partial_bind_rollback=PASS runtime_child=PASS "
+                + "bound_abort=PASS scheduler_epoch=PASS");
     }
 
     private static void exactBoundaryLookupFailsClosed() {
@@ -609,6 +611,46 @@ public final class TaskProofIdentityOracle {
                 "partial scope binding manufactured physical quiescence");
     }
 
+
+    private static void partialBindRollbackUsesExactNeverStartedChild() {
+        SchedulerModel scheduler = new SchedulerModel();
+        RuntimeChildHandle[] accepted = {null};
+        RuntimeChildHandle[] retired = {null};
+        RuntimeException bindFailure =
+                new RuntimeException("bind failed after accepting child");
+
+        ExactChildRetirement partial = new ExactChildRetirement() {
+            @Override
+            public void bind(RuntimeChildHandle child) {
+                accepted[0] = child;
+                throw bindFailure;
+            }
+
+            @Override
+            public void retireNeverStarted(RuntimeChildHandle child) {
+                check(child == accepted[0],
+                        "partial-bind rollback used a different child");
+                retired[0] = child;
+            }
+
+            @Override
+            public void retirePhysical(RuntimeChildHandle child) {
+                throw new AssertionError(
+                        "partial bind reached physical retirement");
+            }
+        };
+
+        RuntimeChildHandle exact =
+                new RuntimeChildHandle(scheduler.epoch, new Object());
+        RuntimeException observed = expectAndReturn(
+                RuntimeException.class,
+                () -> partial.bind(exact),
+                "partial exact-child bind must surface failure");
+        check(observed == bindFailure, "partial bind failure identity changed");
+        partial.retireNeverStarted(exact);
+        check(accepted[0] == exact && retired[0] == exact,
+                "never-started rollback did not retain exact child identity");
+    }
 
     private static void exactRuntimeChildRetirementIsIdentityBound() {
         SchedulerModel scheduler = new SchedulerModel();
