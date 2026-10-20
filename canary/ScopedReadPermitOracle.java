@@ -221,6 +221,8 @@ public final class ScopedReadPermitOracle {
         }
 
         private final Map<Long, RegionLease> regions = new HashMap<>();
+        private final Set<LeaseChild> liveChildren =
+                Collections.newSetFromMap(new IdentityHashMap<>());
 
         synchronized LeaseChild fork(Proof proof) {
             if (proof.mode() != Mode.SCOPED_READ_BORROW || !"$".equals(proof.path())) {
@@ -233,8 +235,12 @@ public final class ScopedReadPermitOracle {
             RegionLease lease = regions.computeIfAbsent(
                     proof.regionId(),
                     ignored -> new RegionLease(proof.generation()));
+            LeaseChild child = new LeaseChild(proof);
+            if (!liveChildren.add(child)) {
+                throw new AssertionError("duplicate lease child identity");
+            }
             lease.readers++;
-            return new LeaseChild(proof);
+            return child;
         }
 
         synchronized void terminal(LeaseChild child) {
@@ -260,9 +266,10 @@ public final class ScopedReadPermitOracle {
         }
 
         synchronized void requireLiveForResume(LeaseChild child) {
-            if (!hasLease(child.proof.regionId(), child.proof.generation())) {
+            if (!liveChildren.contains(child)
+                    || !hasLease(child.proof.regionId(), child.proof.generation())) {
                 throw new IllegalStateException(
-                        "scoped read continuation resumed without a live lease");
+                        "scoped read continuation resumed without its exact live lease");
             }
         }
 
@@ -273,6 +280,9 @@ public final class ScopedReadPermitOracle {
                     || lease.generation != child.proof.generation()
                     || lease.readers <= 0) {
                 throw new AssertionError("lease accounting corrupted");
+            }
+            if (!liveChildren.remove(child)) {
+                throw new AssertionError("lease child identity retired twice");
             }
             child.retired = true;
             lease.readers--;
@@ -298,7 +308,8 @@ public final class ScopedReadPermitOracle {
                 "SCOPED_READ_PERMIT_ORACLE=PASS "
                 + "suspension=PASS exact_binding=PASS nested_ticket=PASS "
                 + "reborrow=PASS deferred=PASS mutation=PASS generation=PASS stale=PASS "
-                + "lifetime=PASS live_generation=PASS readers=PASS resume_guard=PASS");
+                + "lifetime=PASS live_generation=PASS readers=PASS "
+                + "claim_identity=PASS resume_guard=PASS");
     }
 
     private static void directReadSurvivesSuspension() {
@@ -460,6 +471,10 @@ public final class ScopedReadPermitOracle {
         scope.quiescent(a);
         check(scope.readers(91L) == 1,
                 "first sibling retirement released both readers");
+        check(scope.hasLease(91L, 2L),
+                "aggregate region should remain live for sibling");
+        expectFailure(() -> scope.requireLiveForResume(a));
+        scope.requireLiveForResume(b);
 
         scope.quiescent(b);
         scope.terminal(b);
