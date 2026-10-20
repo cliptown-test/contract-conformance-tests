@@ -347,6 +347,79 @@ public final class TaskProofIdentityOracle {
         }
     }
 
+    private static final class ThreeEdgeLoan {
+        private enum State {
+            MINTED,
+            SCOPE_BOUND,
+            CHILD_BOUND,
+            RETIRED
+        }
+
+        private State state = State.MINTED;
+        private Object scopeEpoch;
+        private Object exactChild;
+
+        void bindScope(Object epoch) {
+            Objects.requireNonNull(epoch, "scope epoch");
+            if (state != State.MINTED) {
+                throw new IllegalStateException("scope bound twice");
+            }
+            scopeEpoch = epoch;
+            state = State.SCOPE_BOUND;
+        }
+
+        void bindChild(Object epoch, Object child) {
+            requireScope(epoch);
+            Objects.requireNonNull(child, "child");
+            if (state != State.SCOPE_BOUND) {
+                throw new IllegalStateException("child bind requires scope-only state");
+            }
+            exactChild = child;
+            state = State.CHILD_BOUND;
+        }
+
+        void retireBeforeChildBound(Object epoch) {
+            requireScope(epoch);
+            if (state != State.SCOPE_BOUND || exactChild != null) {
+                throw new IllegalStateException(
+                        "pre-child retirement requires scope-only binding");
+            }
+            state = State.RETIRED;
+        }
+
+        void retireNeverStarted(Object epoch, Object child) {
+            requireScope(epoch);
+            Objects.requireNonNull(child, "child");
+            if (state != State.CHILD_BOUND || exactChild != child) {
+                throw new IllegalArgumentException(
+                        "never-started retirement requires exact child");
+            }
+            exactChild = null;
+            state = State.RETIRED;
+        }
+
+        void retirePhysical(Object epoch, Object child) {
+            requireScope(epoch);
+            Objects.requireNonNull(child, "child");
+            if (state != State.CHILD_BOUND || exactChild != child) {
+                throw new IllegalArgumentException(
+                        "physical retirement requires exact child");
+            }
+            exactChild = null;
+            state = State.RETIRED;
+        }
+
+        private void requireScope(Object epoch) {
+            Objects.requireNonNull(epoch, "scope epoch");
+            if (scopeEpoch != epoch) {
+                throw new IllegalArgumentException("scope epoch mismatch");
+            }
+            if (state == State.MINTED || state == State.RETIRED) {
+                throw new IllegalStateException("loan not live");
+            }
+        }
+    }
+
     public static void main(String[] args) {
         exactBoundaryLookupFailsClosed();
         scopeEpochRejectsForeignAndStaleTickets();
@@ -359,12 +432,13 @@ public final class TaskProofIdentityOracle {
         exactRuntimeChildRetirementIsIdentityBound();
         boundLeaseCannotBeAbortedByOuterFailure();
         crossSchedulerChildCannotRetireAuthority();
+        threeEdgeLoanLifecycleRejectsChildlessBypass();
         System.out.println(
                 "TASK_PROOF_IDENTITY_ORACLE=PASS exact_boundary=PASS scope_epoch=PASS "
                 + "reservation=PASS exact_child=PASS generation=PASS poison=PASS "
                 + "pre_dispatch_poison=PASS partial_bind_poison=PASS "
                 + "partial_bind_rollback=PASS runtime_child=PASS "
-                + "bound_abort=PASS scheduler_epoch=PASS");
+                + "bound_abort=PASS scheduler_epoch=PASS three_edge_loan=PASS");
     }
 
     private static void exactBoundaryLookupFailsClosed() {
@@ -710,6 +784,45 @@ public final class TaskProofIdentityOracle {
         owner.physical(lease, child);
         check(!lease.retained(),
                 "owner scheduler could not retire exact child");
+    }
+
+    private static void threeEdgeLoanLifecycleRejectsChildlessBypass() {
+        Object epoch = new Object();
+        Object foreignEpoch = new Object();
+        Object exact = new Object();
+        Object lookalike = new Object();
+
+        ThreeEdgeLoan preChild = new ThreeEdgeLoan();
+        preChild.bindScope(epoch);
+        expect(IllegalArgumentException.class,
+                () -> preChild.retireBeforeChildBound(foreignEpoch),
+                "foreign scope retired pre-child loan");
+        preChild.retireBeforeChildBound(epoch);
+
+        ThreeEdgeLoan never = new ThreeEdgeLoan();
+        never.bindScope(epoch);
+        never.bindChild(epoch, exact);
+        expect(IllegalStateException.class,
+                () -> never.retireBeforeChildBound(epoch),
+                "scope-only edge bypassed committed child binding");
+        expect(IllegalArgumentException.class,
+                () -> never.retireNeverStarted(epoch, lookalike),
+                "lookalike child retired never-started loan");
+        never.retireNeverStarted(epoch, exact);
+
+        ThreeEdgeLoan physical = new ThreeEdgeLoan();
+        physical.bindScope(epoch);
+        physical.bindChild(epoch, exact);
+        expect(IllegalArgumentException.class,
+                () -> physical.retirePhysical(epoch, lookalike),
+                "lookalike child retired physical loan");
+        physical.retirePhysical(epoch, exact);
+
+        ThreeEdgeLoan unbound = new ThreeEdgeLoan();
+        unbound.bindScope(epoch);
+        expect(IllegalArgumentException.class,
+                () -> unbound.retireNeverStarted(epoch, exact),
+                "arbitrary child retroactively authenticated scope-only loan");
     }
 
     private static <T extends Throwable> void expect(
