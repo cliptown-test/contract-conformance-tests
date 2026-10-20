@@ -237,6 +237,116 @@ public final class TaskProofIdentityOracle {
         }
     }
 
+
+    private static final class SchedulerEpoch { }
+
+    private static final class RuntimeChildHandle {
+        private final SchedulerEpoch epoch;
+        private final Object runner;
+
+        private RuntimeChildHandle(SchedulerEpoch epoch, Object runner) {
+            this.epoch = Objects.requireNonNull(epoch, "scheduler epoch");
+            this.runner = Objects.requireNonNull(runner, "runner identity");
+        }
+    }
+
+    private interface ExactChildRetirement {
+        void bind(RuntimeChildHandle child);
+        void retireNeverStarted(RuntimeChildHandle child);
+        void retirePhysical(RuntimeChildHandle child);
+    }
+
+    private static final class ExactTransferLease
+            implements ExactChildRetirement {
+        private enum Phase {
+            UNBOUND,
+            BOUND,
+            RETIRED
+        }
+
+        private Phase phase = Phase.UNBOUND;
+        private RuntimeChildHandle exactChild;
+        private boolean retained = true;
+
+        @Override
+        public void bind(RuntimeChildHandle child) {
+            Objects.requireNonNull(child, "child");
+            if (phase != Phase.UNBOUND || exactChild != null) {
+                throw new IllegalStateException("lease bound more than once");
+            }
+            exactChild = child;
+            phase = Phase.BOUND;
+        }
+
+        @Override
+        public void retireNeverStarted(RuntimeChildHandle child) {
+            retireExact(child);
+        }
+
+        @Override
+        public void retirePhysical(RuntimeChildHandle child) {
+            retireExact(child);
+        }
+
+        void abortIfUnbound() {
+            if (phase == Phase.UNBOUND) {
+                phase = Phase.RETIRED;
+                retained = false;
+            }
+        }
+
+        boolean retained() {
+            return retained;
+        }
+
+        RuntimeChildHandle exactChild() {
+            return exactChild;
+        }
+
+        private void retireExact(RuntimeChildHandle child) {
+            Objects.requireNonNull(child, "child");
+            if (phase != Phase.BOUND || exactChild != child) {
+                throw new IllegalStateException(
+                        "retirement does not match exact bound child");
+            }
+            phase = Phase.RETIRED;
+            retained = false;
+        }
+    }
+
+    private static final class SchedulerModel {
+        private final SchedulerEpoch epoch = new SchedulerEpoch();
+
+        RuntimeChildHandle bind(ExactChildRetirement retirement) {
+            RuntimeChildHandle child =
+                    new RuntimeChildHandle(epoch, new Object());
+            retirement.bind(child);
+            return child;
+        }
+
+        void neverStarted(
+                ExactChildRetirement retirement,
+                RuntimeChildHandle child) {
+            requireEpoch(child);
+            retirement.retireNeverStarted(child);
+        }
+
+        void physical(
+                ExactChildRetirement retirement,
+                RuntimeChildHandle child) {
+            requireEpoch(child);
+            retirement.retirePhysical(child);
+        }
+
+        private void requireEpoch(RuntimeChildHandle child) {
+            if (child.epoch != epoch) {
+                throw new IllegalArgumentException(
+                        "compiler child belongs to another scheduler epoch");
+            }
+            Objects.requireNonNull(child.runner, "runner identity");
+        }
+    }
+
     public static void main(String[] args) {
         exactBoundaryLookupFailsClosed();
         scopeEpochRejectsForeignAndStaleTickets();
@@ -245,10 +355,14 @@ public final class TaskProofIdentityOracle {
         retirementFailureCannotPublishDrainWitness();
         preDispatchRetirementFailureRetainsExactAuthority();
         partialScopeBindingFailureRetainsExactAuthority();
+        exactRuntimeChildRetirementIsIdentityBound();
+        boundLeaseCannotBeAbortedByOuterFailure();
+        crossSchedulerChildCannotRetireAuthority();
         System.out.println(
                 "TASK_PROOF_IDENTITY_ORACLE=PASS exact_boundary=PASS scope_epoch=PASS "
                 + "reservation=PASS exact_child=PASS generation=PASS poison=PASS "
-                + "pre_dispatch_poison=PASS partial_bind_poison=PASS");
+                + "pre_dispatch_poison=PASS partial_bind_poison=PASS "
+                + "runtime_child=PASS bound_abort=PASS scheduler_epoch=PASS");
     }
 
     private static void exactBoundaryLookupFailsClosed() {
@@ -493,6 +607,67 @@ public final class TaskProofIdentityOracle {
                 "partially bound exact loan was not retained");
         check(!scope.physicallyQuiescent(),
                 "partial scope binding manufactured physical quiescence");
+    }
+
+
+    private static void exactRuntimeChildRetirementIsIdentityBound() {
+        SchedulerModel scheduler = new SchedulerModel();
+        ExactTransferLease physicalLease = new ExactTransferLease();
+        RuntimeChildHandle physicalChild = scheduler.bind(physicalLease);
+        RuntimeChildHandle lookalike =
+                new RuntimeChildHandle(physicalChild.epoch, new Object());
+
+        expect(IllegalStateException.class,
+                () -> physicalLease.retirePhysical(lookalike),
+                "lookalike runtime child retired exact ownership");
+        check(physicalLease.retained(),
+                "lookalike runtime child released ownership");
+        scheduler.physical(physicalLease, physicalChild);
+        check(!physicalLease.retained(),
+                "exact physical child did not retire ownership");
+
+        ExactTransferLease neverLease = new ExactTransferLease();
+        RuntimeChildHandle neverChild = scheduler.bind(neverLease);
+        scheduler.neverStarted(neverLease, neverChild);
+        check(!neverLease.retained(),
+                "exact never-started child did not retire ownership");
+        check(physicalChild != neverChild,
+                "distinct admissions shared one runtime child token");
+    }
+
+    private static void boundLeaseCannotBeAbortedByOuterFailure() {
+        SchedulerModel scheduler = new SchedulerModel();
+        ExactTransferLease lease = new ExactTransferLease();
+        RuntimeChildHandle child = scheduler.bind(lease);
+
+        lease.abortIfUnbound();
+        check(lease.retained(),
+                "outer failure released a lease already owned by runtime child");
+        scheduler.physical(lease, child);
+        check(!lease.retained(),
+                "runtime child could not retire bound lease");
+
+        ExactTransferLease neverBound = new ExactTransferLease();
+        neverBound.abortIfUnbound();
+        check(!neverBound.retained(),
+                "pre-binding failure did not release caller-owned lease");
+    }
+
+    private static void crossSchedulerChildCannotRetireAuthority() {
+        SchedulerModel owner = new SchedulerModel();
+        SchedulerModel foreign = new SchedulerModel();
+        ExactTransferLease lease = new ExactTransferLease();
+        RuntimeChildHandle child = owner.bind(lease);
+
+        expect(IllegalArgumentException.class,
+                () -> foreign.physical(lease, child),
+                "foreign scheduler epoch accepted exact child token");
+        check(lease.retained(),
+                "foreign scheduler released exact-child authority");
+
+        owner.physical(lease, child);
+        check(!lease.retained(),
+                "owner scheduler could not retire exact child");
     }
 
     private static <T extends Throwable> void expect(
