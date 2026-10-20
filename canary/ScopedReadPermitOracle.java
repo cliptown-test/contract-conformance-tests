@@ -17,6 +17,11 @@ import java.util.concurrent.atomic.AtomicInteger;
 public final class ScopedReadPermitOracle {
     private ScopedReadPermitOracle() { }
 
+    private static final class FatalHostError extends Error {
+        private static final long serialVersionUID = 1L;
+        FatalHostError(String message) { super(message); }
+    }
+
     private enum Mode { OWNED_SEND, SCOPED_READ_BORROW }
 
     private static final class ScopePoison extends RuntimeException {
@@ -435,7 +440,8 @@ public final class ScopedReadPermitOracle {
                 + "lifetime=PASS live_generation=PASS readers=PASS "
                 + "claim_identity=PASS aba=PASS cross_scope=PASS "
                 + "poison=PASS poison_barrier=PASS poison_healthy_retire=PASS "
-                + "poison_unmaskable=PASS checked_wrapper=PASS resume_guard=PASS");
+                + "poison_unmaskable=PASS checked_wrapper=PASS fatal_cleanup=PASS "
+                + "resume_guard=PASS");
     }
 
     private static void directReadSurvivesSuspension() {
@@ -774,6 +780,43 @@ public final class ScopedReadPermitOracle {
             if (seen.size() + pending.size() > 64) return false;
         }
         return true;
+    }
+
+
+    private static void fatalCleanupOutranksScopePoison() {
+        ScopePoison poison = new ScopePoison("authority accounting poisoned");
+        FatalHostError fatal = new FatalHostError("vm fatal");
+        Throwable winner = mergeCleanupFailure(poison, fatal);
+        check(winner == fatal, "host-fatal cleanup was masked by scope poison");
+        check(fatal.getSuppressed().length == 1
+                        && fatal.getSuppressed()[0] == poison,
+                "scope poison was not retained as suppressed diagnostic");
+
+        FatalHostError earlierFatal = new FatalHostError("earlier vm fatal");
+        ScopePoison laterPoison = new ScopePoison("later poison");
+        Throwable earlierWinner = mergeCleanupFailure(earlierFatal, laterPoison);
+        check(earlierWinner == earlierFatal,
+                "later scope poison replaced an earlier host-fatal failure");
+        check(earlierFatal.getSuppressed().length == 1
+                        && earlierFatal.getSuppressed()[0] == laterPoison,
+                "later poison was not retained under earlier host-fatal failure");
+    }
+
+    private static Throwable mergeCleanupFailure(
+            Throwable earlier, Throwable cleanup) {
+        if (earlier == cleanup) return earlier;
+        boolean earlierFatal = earlier instanceof Error;
+        boolean cleanupFatal = cleanup instanceof Error;
+        if (cleanupFatal && !earlierFatal) {
+            cleanup.addSuppressed(earlier);
+            return cleanup;
+        }
+        if (earlierFatal || earlier instanceof ScopePoison) {
+            earlier.addSuppressed(cleanup);
+            return earlier;
+        }
+        cleanup.addSuppressed(earlier);
+        return cleanup;
     }
 
     private static void ownedProofCarriesNoAuthority() {
