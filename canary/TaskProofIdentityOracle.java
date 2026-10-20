@@ -534,6 +534,69 @@ public final class TaskProofIdentityOracle {
         }
     }
 
+    private static final class SchedulerOwnedAdmission {
+        private enum State {
+            PREPARED,
+            BOUND,
+            REGISTERED,
+            ENTERED,
+            NEVER_REGISTERED,
+            QUIESCENT,
+            INDETERMINATE
+        }
+
+        private State state = State.PREPARED;
+
+        State state() {
+            return state;
+        }
+
+        void bound() {
+            transition(State.PREPARED, State.BOUND);
+        }
+
+        void registered() {
+            transition(State.BOUND, State.REGISTERED);
+        }
+
+        void entered() {
+            if (state == State.ENTERED) return;
+            transition(State.REGISTERED, State.ENTERED);
+        }
+
+        void neverRegistered() {
+            if (state != State.PREPARED && state != State.BOUND) {
+                throw new IllegalStateException(
+                        "registered child cannot become never-registered");
+            }
+            state = State.NEVER_REGISTERED;
+        }
+
+        void indeterminate() {
+            if (state != State.PREPARED && state != State.BOUND) {
+                throw new IllegalStateException(
+                        "registered child cannot become indeterminate");
+            }
+            state = State.INDETERMINATE;
+        }
+
+        void quiescent() {
+            if (state != State.REGISTERED && state != State.ENTERED) {
+                throw new IllegalStateException(
+                        "only a registered child can become quiescent");
+            }
+            state = State.QUIESCENT;
+        }
+
+        private void transition(State expected, State next) {
+            if (state != expected) {
+                throw new IllegalStateException(
+                        "invalid scheduler admission transition");
+            }
+            state = next;
+        }
+    }
+
     public static void main(String[] args) {
         exactBoundaryLookupFailsClosed();
         scopeEpochRejectsForeignAndStaleTickets();
@@ -552,6 +615,8 @@ public final class TaskProofIdentityOracle {
         cleanupPrecedesExactLoanRetirement();
         partialOwnerAndSchedulerBindFailuresPoison();
         indeterminateSchedulerAdmissionPinsResources();
+        schedulerOwnedAdmissionIsMonotonic();
+        schedulerStateAloneControlsCleanup();
         System.out.println(
                 "TASK_PROOF_IDENTITY_ORACLE=PASS exact_boundary=PASS scope_epoch=PASS "
                 + "reservation=PASS exact_child=PASS generation=PASS poison=PASS "
@@ -560,7 +625,8 @@ public final class TaskProofIdentityOracle {
                 + "bound_abort=PASS scheduler_epoch=PASS three_edge_loan=PASS "
                 + "owner_scheduler_chain=PASS cleanup_order=PASS "
                 + "partial_owner_scheduler_bind_poison=PASS "
-                + "ticket_identity=PASS indeterminate_admission=PASS");
+                + "ticket_identity=PASS indeterminate_admission=PASS "
+                + "scheduler_owned_state=PASS scheduler_cleanup_gate=PASS");
     }
 
     private static void exactBoundaryLookupFailsClosed() {
@@ -1093,6 +1159,60 @@ public final class TaskProofIdentityOracle {
         check(retained.containsKey(loanAuthority)
                         && retained.containsKey(resourceAuthority),
                 "indeterminate admission failed to pin loan and resources");
+    }
+
+    private static void schedulerOwnedAdmissionIsMonotonic() {
+        SchedulerOwnedAdmission live = new SchedulerOwnedAdmission();
+        live.bound();
+        live.registered();
+        expect(IllegalStateException.class,
+                live::neverRegistered,
+                "registered child regressed to never-registered");
+        live.entered();
+        live.entered();
+        live.quiescent();
+        check(live.state() == SchedulerOwnedAdmission.State.QUIESCENT,
+                "live child did not reach quiescent");
+
+        SchedulerOwnedAdmission rejected = new SchedulerOwnedAdmission();
+        rejected.bound();
+        rejected.neverRegistered();
+        expect(IllegalStateException.class,
+                rejected::quiescent,
+                "never-registered child manufactured physical quiescence");
+
+        SchedulerOwnedAdmission uncertain = new SchedulerOwnedAdmission();
+        uncertain.bound();
+        uncertain.indeterminate();
+        expect(IllegalStateException.class,
+                uncertain::neverRegistered,
+                "indeterminate child was retroactively certified absent");
+    }
+
+    private static void schedulerStateAloneControlsCleanup() {
+        for (SchedulerOwnedAdmission.State state
+                : SchedulerOwnedAdmission.State.values()) {
+            boolean cleanupAllowed =
+                    state == SchedulerOwnedAdmission.State.NEVER_REGISTERED
+                    || state == SchedulerOwnedAdmission.State.QUIESCENT;
+            boolean physicalCleanup =
+                    state == SchedulerOwnedAdmission.State.QUIESCENT;
+            boolean preRegistrationCleanup =
+                    state == SchedulerOwnedAdmission.State.NEVER_REGISTERED;
+
+            if (state == SchedulerOwnedAdmission.State.REGISTERED
+                    || state == SchedulerOwnedAdmission.State.ENTERED
+                    || state == SchedulerOwnedAdmission.State.INDETERMINATE
+                    || state == SchedulerOwnedAdmission.State.BOUND
+                    || state == SchedulerOwnedAdmission.State.PREPARED) {
+                check(!cleanupAllowed,
+                        "nonterminal scheduler state authorized cleanup: " + state);
+            }
+            if (physicalCleanup) {
+                check(!preRegistrationCleanup,
+                        "quiescent child confused with never-registered child");
+            }
+        }
     }
 
     private static <T extends Throwable> void expect(
