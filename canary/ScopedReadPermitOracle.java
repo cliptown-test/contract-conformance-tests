@@ -1,7 +1,9 @@
 package canary;
 
 import java.util.Collections;
+import java.util.HashMap;
 import java.util.IdentityHashMap;
+import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.atomic.AtomicLong;
 
@@ -196,6 +198,81 @@ public final class ScopedReadPermitOracle {
         }
     }
 
+
+    private static final class LeaseScope {
+        private static final class RegionLease {
+            final long generation;
+            int readers;
+
+            RegionLease(long generation) {
+                this.generation = generation;
+            }
+        }
+
+        private static final class LeaseChild {
+            final Proof proof;
+            boolean terminal;
+            boolean quiescent;
+            boolean retired;
+
+            LeaseChild(Proof proof) {
+                this.proof = proof;
+            }
+        }
+
+        private final Map<Long, RegionLease> regions = new HashMap<>();
+
+        synchronized LeaseChild fork(Proof proof) {
+            if (proof.mode() != Mode.SCOPED_READ_BORROW || !"$".equals(proof.path())) {
+                throw new IllegalArgumentException("whole-region read proof required");
+            }
+            RegionLease existing = regions.get(proof.regionId());
+            if (existing != null && existing.generation != proof.generation()) {
+                throw new IllegalStateException("stale live generation");
+            }
+            RegionLease lease = regions.computeIfAbsent(
+                    proof.regionId(),
+                    ignored -> new RegionLease(proof.generation()));
+            lease.readers++;
+            return new LeaseChild(proof);
+        }
+
+        synchronized void terminal(LeaseChild child) {
+            child.terminal = true;
+            retireIfReady(child);
+        }
+
+        synchronized void quiescent(LeaseChild child) {
+            child.quiescent = true;
+            retireIfReady(child);
+        }
+
+        synchronized boolean hasLease(long regionId, long generation) {
+            RegionLease lease = regions.get(regionId);
+            return lease != null
+                    && lease.generation == generation
+                    && lease.readers > 0;
+        }
+
+        synchronized int readers(long regionId) {
+            RegionLease lease = regions.get(regionId);
+            return lease == null ? 0 : lease.readers;
+        }
+
+        private void retireIfReady(LeaseChild child) {
+            if (child.retired || !child.terminal || !child.quiescent) return;
+            RegionLease lease = regions.get(child.proof.regionId());
+            if (lease == null
+                    || lease.generation != child.proof.generation()
+                    || lease.readers <= 0) {
+                throw new AssertionError("lease accounting corrupted");
+            }
+            child.retired = true;
+            lease.readers--;
+            if (lease.readers == 0) regions.remove(child.proof.regionId());
+        }
+    }
+
     public static void main(String[] args) {
         directReadSurvivesSuspension();
         outsideScopeFails();
@@ -206,12 +283,15 @@ public final class ScopedReadPermitOracle {
         mutationIsExcludedWhileLoanLives();
         valueAssignmentDoesNotRotateRegionGeneration();
         actualRegionReuseInvalidatesStaleProof();
+        runtimeLeaseSurvivesLogicalCancellationUntilPhysicalQuiescence();
+        concurrentReadersShareGenerationAndRejectMismatchAtomically();
         ownedProofCarriesNoAuthority();
 
         System.out.println(
                 "SCOPED_READ_PERMIT_ORACLE=PASS "
                 + "suspension=PASS exact_binding=PASS nested_ticket=PASS "
-                + "reborrow=PASS deferred=PASS mutation=PASS generation=PASS stale=PASS");
+                + "reborrow=PASS deferred=PASS mutation=PASS generation=PASS stale=PASS "
+                + "lifetime=PASS live_generation=PASS readers=PASS");
     }
 
     private static void directReadSurvivesSuspension() {
@@ -331,6 +411,51 @@ public final class ScopedReadPermitOracle {
 
         region.reuse(99);
         expectFailure(() -> new Child(proof, region, true));
+    }
+
+
+    private static void runtimeLeaseSurvivesLogicalCancellationUntilPhysicalQuiescence() {
+        Proof proof = new Proof("view", Mode.SCOPED_READ_BORROW, 77L, 4L, "$");
+        LeaseScope scope = new LeaseScope();
+        LeaseScope.LeaseChild child = scope.fork(proof);
+
+        check(scope.hasLease(77L, 4L), "lease missing after admission");
+        scope.terminal(child);
+        check(scope.hasLease(77L, 4L),
+                "logical terminal state retired authority before physical quiescence");
+        check(scope.readers(77L) == 1, "reader count changed before quiescence");
+
+        scope.quiescent(child);
+        check(!scope.hasLease(77L, 4L),
+                "lease remained live after terminal + physical quiescence");
+        check(scope.readers(77L) == 0, "reader count leaked after retirement");
+    }
+
+    private static void concurrentReadersShareGenerationAndRejectMismatchAtomically() {
+        Proof left = new Proof("left", Mode.SCOPED_READ_BORROW, 91L, 2L, "$");
+        Proof right = new Proof("right", Mode.SCOPED_READ_BORROW, 91L, 2L, "$");
+        Proof stale = new Proof("stale", Mode.SCOPED_READ_BORROW, 91L, 3L, "$");
+        LeaseScope scope = new LeaseScope();
+
+        LeaseScope.LeaseChild a = scope.fork(left);
+        LeaseScope.LeaseChild b = scope.fork(right);
+        check(scope.readers(91L) == 2, "shared readers were not counted");
+
+        expectFailure(() -> scope.fork(stale));
+        check(scope.readers(91L) == 2,
+                "rejected generation mismatch mutated live reader authority");
+        check(scope.hasLease(91L, 2L), "valid generation disappeared");
+        check(!scope.hasLease(91L, 3L), "stale generation became live");
+
+        scope.terminal(a);
+        scope.quiescent(a);
+        check(scope.readers(91L) == 1,
+                "first sibling retirement released both readers");
+
+        scope.quiescent(b);
+        scope.terminal(b);
+        check(scope.readers(91L) == 0,
+                "last sibling retirement leaked read authority");
     }
 
     private static void ownedProofCarriesNoAuthority() {
